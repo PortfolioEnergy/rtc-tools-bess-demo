@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rtc-tools-bess-demo"
+version = "0.1.0"
+description = "Simple RTC-Tools BESS optimisation demo"
+authors = [
+    {name = "PortfolioEnergy", email = "info@portfolioenergy.com"},
+]
+readme = "README.md"
+requires-python = "==3.13.*"
+dependencies = [
+    "rtc-tools>=2.7.0b3",
+    "numpy>=1.26.0",
+    "matplotlib>=3.7.0",
+    "pandas>=2.2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "sphinx",
+    "sphinx-rtd-theme",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
