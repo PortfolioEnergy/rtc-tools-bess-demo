@@ -7,7 +7,7 @@ import sys
 
 # If extensions (or modules to document) are in another directory, add these
 # directories to sys.path here.
-sys.path.insert(0, os.path.abspath('../../src'))
+sys.path.insert(0, os.path.abspath('../src'))
 
 # -- Project information -----------------------------------------------------
 
