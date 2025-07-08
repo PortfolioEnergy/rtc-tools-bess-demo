@@ -106,7 +106,7 @@ Physical Asset Model (Modelica)
 
 The BESS physical model is implemented in pure Modelica without external library dependencies:
 
-.. literalinclude:: ../../model/BESS.mo
+.. literalinclude:: ../model/BESS.mo
    :language: modelica
    :caption: BESS.mo - Physical asset model (battery dynamics only)
 
@@ -115,7 +115,7 @@ Value Stream Model (Python)
 
 **Objective Function (Economic Model):**
 
-.. literalinclude:: ../../src/bess.py
+.. literalinclude:: ../src/bess.py
    :language: python
    :pyobject: BESS.path_objective
 
@@ -127,7 +127,7 @@ The objective function demonstrates the value stream modeling:
 
 **Solver Configuration:**
 
-.. literalinclude:: ../../src/bess.py
+.. literalinclude:: ../src/bess.py
    :language: python
    :pyobject: BESS.solver_options
 
@@ -135,7 +135,7 @@ The example uses the HiGHS mixed-integer linear programming solver.
 
 **Path Constraints:**
 
-.. literalinclude:: ../../src/bess.py
+.. literalinclude:: ../src/bess.py
    :language: python
    :pyobject: BESS.path_constraints
 
@@ -195,7 +195,7 @@ Results and Analysis
 
 Key outputs from the optimization are visualized below:
 
-.. image:: ../../output/bess_optimisation_results.png
+.. image:: ../output/bess_optimisation_results.png
    :alt: BESS Optimization Results
    :width: 800px
    :align: center
