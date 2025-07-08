@@ -18,8 +18,11 @@ dependencies = [
     "pandas>=2.2.3",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
+    {include-group = "docs"},
+]
+docs = [
     "sphinx",
     "sphinx-rtd-theme",
 ]

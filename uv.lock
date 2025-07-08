@@ -484,8 +484,12 @@ dependencies = [
     { name = "rtc-tools" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 dev = [
+    { name = "sphinx" },
+    { name = "sphinx-rtd-theme" },
+]
+docs = [
     { name = "sphinx" },
     { name = "sphinx-rtd-theme" },
 ]
@@ -496,10 +500,17 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pandas", specifier = ">=2.2.3" },
     { name = "rtc-tools", specifier = ">=2.7.0b3" },
-    { name = "sphinx", marker = "extra == 'dev'" },
-    { name = "sphinx-rtd-theme", marker = "extra == 'dev'" },
 ]
-provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "sphinx" },
+    { name = "sphinx-rtd-theme" },
+]
+docs = [
+    { name = "sphinx" },
+    { name = "sphinx-rtd-theme" },
+]
 
 [[package]]
 name = "rtc-tools-channel-flow"
