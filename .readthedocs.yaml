@@ -9,3 +9,9 @@ build:
   os: ubuntu-24.04
   tools:
     python: "3.13"
+  commands:
+    - pip install uv
+    - uv run python -m sphinx docs $READTHEDOCS_OUTPUT/html -b html -W
+
+sphinx:
+  configuration: docs/conf.py
