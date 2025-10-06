@@ -26,7 +26,7 @@ class BESS(
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         # Economic parameters (not in Modelica model)
-        self.cycling_penalty_factor = 0.1  # $/MW cycling penalty
+        self.cycling_penalty_factor = 0.1  # $/MWh cycling penalty
 
     def solver_options(self):
         """Configure solver options for mixed-integer optimization."""
@@ -60,25 +60,24 @@ class BESS(
         parameters = self.parameters(ensemble_member)
         
         # Ensure only one mode can be active at a time (complementarity)
-        for t in self.times():
-            constraints.append((
-                self.state('is_charging') + 
-                self.state('is_discharging'),
-                -np.inf,
-                1.0,
-            ))
-            constraints.append((
-                self.state('charge_power') -
-                self.state('is_charging') * parameters["max_power"],
-                -np.inf,
-                0,
-            ))
-            constraints.append((
-                self.state('discharge_power') -
-                self.state('is_discharging') * parameters["max_power"],
-                -np.inf,
-                0,
-            ))
+        constraints.append((
+            self.state('is_charging') + 
+            self.state('is_discharging'),
+            -np.inf,
+            1.0,
+        ))
+        constraints.append((
+            self.state('charge_power') -
+            self.state('is_charging') * parameters["max_power"],
+            -np.inf,
+            0,
+        ))
+        constraints.append((
+            self.state('discharge_power') -
+            self.state('is_discharging') * parameters["max_power"],
+            -np.inf,
+            0,
+        ))
         
         return constraints
 
@@ -88,7 +87,7 @@ class BESS(
         
         print("Optimization completed successfully!")
         print("Results saved to output/timeseries_export.csv")
-        print("Run 'python src/plot_results.py' to generate plots and summary statistics.")
+        print("Run 'uv run python src/plot_results.py' to generate plots and summary statistics.")
 
 
 if __name__ == "__main__":
