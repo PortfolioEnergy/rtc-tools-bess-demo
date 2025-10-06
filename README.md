@@ -1,6 +1,12 @@
-# RTC-Tools BESS Optimization Demo
+# RTC-Tools BESS Optimization Demos
 
-This example demonstrates a Battery Energy Storage System (BESS) optimization using RTC-Tools for time arbitrage. The optimization maximizes revenue by charging during low-price periods and discharging during high-price periods, while considering cycling penalties and round-trip efficiency.
+This repository contains two Battery Energy Storage System (BESS) optimization examples using RTC-Tools:
+
+1. **Scheduling Demo** (`scheduling/`): Day-ahead optimization for time arbitrage
+2. **Continuous Intraday Demo** (`continuous_intraday/`): Rolling intrinsic policy[^1][^2] with orderbook trading
+
+[^1]: Schaurecker, D., Wozabal, D., Löhndorf, N., & Staake, T. (2025). "Maximizing Battery Storage Profits via High-Frequency Intraday Trading." arXiv:2504.06932.
+[^2]: Oeltz, D., & Pfingsten, T. (2025). "Rolling intrinsic for battery valuation in day-ahead and intraday markets." arXiv:2510.01956.
 
 ## Requirements
 
@@ -17,46 +23,55 @@ uv sync
 
 ## Usage
 
-Run the optimization:
+Both examples follow the same structure:
+
 ```bash
-uv run python src/bess_optimization.py
+cd <example_directory>
+uv run python src/<script_name>.py
 ```
 
-The optimization will:
+Each optimization will:
 1. Read input data from `input/` folder
 2. Solve the BESS optimization problem
 3. Generate plots in `output/` folder
 4. Print summary statistics
 
-## Input Files
+### Scheduling Demo (`scheduling/`)
 
-- `input/timeseries_import.csv`: Electricity price forecast
-- `input/initial_state.csv`: Initial state of charge
+Day-ahead optimization for time arbitrage using forecasted electricity prices.
 
-## Output
+```bash
+cd scheduling
+uv run python src/bess.py
+```
 
-- `output/bess_optimization_results.png`: Visualization plots
-- Console output with optimization summary
+**Key features:**
+- Single optimization over full day-ahead horizon
+- Uses price forecasts (`input/timeseries_import.csv`)
+- Includes cycling penalty to reduce battery degradation
+
+### Continuous Intraday Demo (`continuous_intraday/`)
+
+Rolling intrinsic optimization with orderbook trading.
+
+```bash
+cd continuous_intraday
+uv run python src/bess_intraday.py
+```
+
+**Key features:**
+- Sequential rolling horizon optimizations
+- Uses orderbook bid/ask prices and volumes (`input/orderbook_YYYYMMDD.csv`)
+- Maximizes intrinsic value at each decision point
 
 ## Model Parameters
 
+Both examples use the same battery model:
 - **Capacity**: 100 MWh
 - **Maximum Power**: 50 MW (charge/discharge)
 - **Round-trip Efficiency**: 90%
-- **Cycling Penalty Factor**: 0.1
 - **Initial SoC**: 50 MWh
-
-## Optimization Objective
-
-Maximize: Revenue - Cycling Penalty
-
-Where:
-- Revenue = Net Power × Electricity Price
-- Cycling Penalty = Cycling Factor × (Charge Power + Discharge Power)
-
-## Solver
-
-Uses HiGHS mixed-integer linear programming solver.
+- **Solver**: HiGHS mixed-integer linear programming
 
 ## License
 

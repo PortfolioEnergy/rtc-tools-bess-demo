@@ -169,8 +169,6 @@ def print_summary(csv_file='output/timeseries_export.csv',
     print("="*50)
     print(f"Total Energy Charged: {total_energy_charged:.2f} MWh")
     print(f"Total Energy Discharged: {total_energy_discharged:.2f} MWh")
-    if total_energy_charged > 0:
-        print(f"Round-trip Efficiency: {(total_energy_discharged/total_energy_charged)*100:.1f}%")
     print(f"Total Revenue: ${total_revenue:.2f}")
     print(f"Total Cycling Penalty: ${total_cycling_penalty:.2f}")
     print(f"Net Profit: ${total_revenue - total_cycling_penalty:.2f}")
