@@ -222,6 +222,13 @@ The optimization produces detailed visualizations showing:
    * Power allocation across different orderbook levels (stacked bars)
    * Cumulative trading revenue
 
+.. image:: ../continuous_intraday/output/bess_intraday_results.png
+   :alt: BESS Intraday Trading Results
+   :width: 800px
+   :align: center
+
+*Figure: BESS intraday trading results showing (top to bottom): State of Charge profile, Charge/Discharge power decisions, Orderbook mid price and bid-ask spread, Power allocation across orderbook levels, All orderbook price levels, All orderbook volume levels, and Cumulative trading revenue.*
+
 The rolling intrinsic policy enables the battery to:
    * React to real-time orderbook conditions
    * Optimize across multiple price levels
