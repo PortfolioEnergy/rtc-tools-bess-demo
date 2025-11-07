@@ -1,10 +1,25 @@
-Scheduling Demo: Day-Ahead Time Arbitrage
-==========================================
+Scheduling Demo: Energy Time Arbitrage
+=======================================
 
 Introduction
 ------------
 
 This example demonstrates how to use RTC-Tools to optimise a Battery Energy Storage System (BESS) for day-ahead time arbitrage. The optimisation maximizes revenue by strategically charging during low electricity price periods and discharging during high price periods, while accounting for round-trip efficiency losses and cycling penalties.
+
+Market Applicability
+~~~~~~~~~~~~~~~~~~~~
+
+This model is applicable to multiple electricity markets:
+
+**European Day-Ahead Markets**
+   * Optimises for EPEX SPOT and other European day-ahead auctions
+   * Typically 24-hour horizon with hourly resolution
+
+**Australian National Electricity Market (NEM)**
+   * Optimises for NEM dispatch intervals (5-minute settlement)
+   * Accommodates NEM's 5-minute dispatch cycles and price volatility
+
+The model is market-agnostic and can be adapted to any day-ahead or dispatch market by adjusting the time series resolution and price data inputs.
 
 Problem Formulation
 -------------------
