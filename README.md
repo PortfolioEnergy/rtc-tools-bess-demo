@@ -8,6 +8,10 @@ This repository contains two Battery Energy Storage System (BESS) optimization e
 [^1]: Schaurecker, D., Wozabal, D., Löhndorf, N., & Staake, T. (2025). "Maximizing Battery Storage Profits via High-Frequency Intraday Trading." arXiv:2504.06932.
 [^2]: Oeltz, D., & Pfingsten, T. (2025). "Rolling intrinsic for battery valuation in day-ahead and intraday markets." arXiv:2510.01956.
 
+## Documentation
+
+Full documentation is available at: https://portfolioenergy-bess-demo.readthedocs.io/en/latest/
+
 ## Requirements
 
 - Python 3.8+
