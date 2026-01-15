@@ -155,6 +155,14 @@ The path constraints enforce:
 Input Data
 ----------
 
+.. note::
+
+   The orderbook data provided in this example is **randomly generated** for demonstration purposes and does not represent real market orderbook data. In a production setting, this data would be sourced from actual market feeds or trading platforms.
+
+.. note::
+
+   The optimizer **automatically adjusts to the time resolution** of the input data. If you provide input data with 15-minute intervals, the optimizer will run at 15-minute frequency. Similarly, 5-minute input data (as in this example) results in 5-minute optimization intervals. This flexibility allows the same model to be used across different market time resolutions without code changes.
+
 The example uses two CSV input files:
 
 **timeseries_import.csv**
