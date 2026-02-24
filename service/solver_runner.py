@@ -77,13 +77,16 @@ def _run_scheduling(model_input: dict[str, Any]) -> dict[str, Any]:
             (ConfigurableBESS,),
             {
                 "_cycling_penalty": translation.cycling_penalty,
+                "_stored_energy_value": translation.stored_energy_value,
                 "model_name": "BESS",
             },
         )
 
         _log.info(
-            "Running scheduling solver (cycling_penalty=%.4f)",
+            "Running scheduling solver (cycling_penalty=%.4f, "
+            "stored_energy_value=%.4f)",
             translation.cycling_penalty,
+            translation.stored_energy_value,
         )
         run_optimization_problem(
             klass,
@@ -121,16 +124,18 @@ def _run_intraday(model_input: dict[str, Any]) -> dict[str, Any]:
             {
                 "_cycling_penalty": translation.cycling_penalty,
                 "_transaction_cost": translation.transaction_cost,
+                "_stored_energy_value": translation.stored_energy_value,
                 "model_name": "BESSIntraday",
             },
         )
 
         _log.info(
             "Running intraday solver (n_segments=%d, cycling_penalty=%.4f, "
-            "transaction_cost=%.4f)",
+            "transaction_cost=%.4f, stored_energy_value=%.4f)",
             translation.n_segments,
             translation.cycling_penalty,
             translation.transaction_cost,
+            translation.stored_energy_value,
         )
         run_optimization_problem(
             klass,

@@ -23,6 +23,7 @@ class TranslationResult:
     cycling_penalty: float
     transaction_cost: float
     n_segments: int
+    stored_energy_value: float = 0.0
     info: list[str] = field(default_factory=list)
 
 
@@ -121,10 +122,11 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
             f"'efficiency' = {efficiency}"
         )
 
-    if stored_energy_value is not None and stored_energy_value != 0.0:
+    sev = stored_energy_value if stored_energy_value is not None else 0.0
+    if sev != 0.0:
         info.append(
-            f"ignored_input: parameter 'stored_energy_value' ({stored_energy_value}) "
-            f"— no terminal energy value in local solver objective"
+            f"approximation: 'stored_energy_value' ({sev} EUR/MWh) applied as "
+            f"terminal SoC valuation in objective"
         )
 
     if epsilon is not None:
@@ -216,6 +218,7 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
         cycling_penalty=cycling_penalty_factor,
         transaction_cost=0.0,
         n_segments=0,
+        stored_energy_value=sev,
         info=info,
     )
 
@@ -296,10 +299,11 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
             f"'efficiency' = {efficiency}"
         )
 
-    if stored_energy_value is not None and stored_energy_value != 0.0:
+    sev = stored_energy_value if stored_energy_value is not None else 0.0
+    if sev != 0.0:
         info.append(
-            f"ignored_input: parameter 'stored_energy_value' ({stored_energy_value}) "
-            f"— no terminal energy value in local solver objective"
+            f"approximation: 'stored_energy_value' ({sev} EUR/MWh) applied as "
+            f"terminal SoC valuation in objective"
         )
 
     if epsilon is not None:
@@ -419,5 +423,6 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
         cycling_penalty=cycling_penalty_factor,
         transaction_cost=0.05,
         n_segments=n_segments,
+        stored_energy_value=sev,
         info=info,
     )

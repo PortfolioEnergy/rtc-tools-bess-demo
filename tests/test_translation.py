@@ -84,15 +84,26 @@ class TestTranslateScheduling:
         ]
         assert len(ignored) == 1
 
-    def test_stored_energy_value_ignored(
+    def test_stored_energy_value_propagated(
         self, scheduling_input: dict[str, Any]
     ) -> None:
         scheduling_input["parameters"].append(
             {"name": "stored_energy_value", "value": 50.0}
         )
         result = translate_scheduling(scheduling_input)
-        ignored = [i for i in result.info if "stored_energy_value" in i]
-        assert len(ignored) == 1
+        assert result.stored_energy_value == 50.0
+        approx_msgs = [
+            i
+            for i in result.info
+            if "stored_energy_value" in i and "approximation:" in i
+        ]
+        assert len(approx_msgs) == 1
+
+    def test_stored_energy_value_defaults_to_zero(
+        self, scheduling_input: dict[str, Any]
+    ) -> None:
+        result = translate_scheduling(scheduling_input)
+        assert result.stored_energy_value == 0.0
 
     def test_epsilon_ignored(self, scheduling_input: dict[str, Any]) -> None:
         scheduling_input["parameters"].append({"name": "epsilon", "value": 0.001})
@@ -186,6 +197,27 @@ class TestTranslateIntraday:
         ]
         result = translate_intraday(intraday_input)
         assert result.cycling_penalty == 5.0
+
+    def test_stored_energy_value_propagated(
+        self, intraday_input: dict[str, Any]
+    ) -> None:
+        intraday_input["parameters"].append(
+            {"name": "stored_energy_value", "value": 70.0}
+        )
+        result = translate_intraday(intraday_input)
+        assert result.stored_energy_value == 70.0
+        approx_msgs = [
+            i
+            for i in result.info
+            if "stored_energy_value" in i and "approximation:" in i
+        ]
+        assert len(approx_msgs) == 1
+
+    def test_stored_energy_value_defaults_to_zero(
+        self, intraday_input: dict[str, Any]
+    ) -> None:
+        result = translate_intraday(intraday_input)
+        assert result.stored_energy_value == 0.0
 
 
 class TestTranslateSetpoints:
