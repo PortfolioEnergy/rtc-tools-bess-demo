@@ -31,7 +31,7 @@ Both examples follow the same structure:
 
 ```bash
 cd <example_directory>
-uv run python src/<script_name>.py
+uv run python <optimization>/src/<script_name>.py
 ```
 
 Each optimization will:
@@ -46,7 +46,7 @@ Day-ahead optimization for time arbitrage using forecasted electricity prices.
 
 ```bash
 cd scheduling
-uv run python src/bess.py
+uv run python scheduling/src/bess.py
 ```
 
 **Key features:**
@@ -60,7 +60,7 @@ Rolling intrinsic optimization with orderbook trading.
 
 ```bash
 cd continuous_intraday
-uv run python src/bess_intraday.py
+uv run python continuous_intraday/src/bess_intraday.py
 ```
 
 **Key features:**
