@@ -32,10 +32,10 @@ class TestTranslateScheduling:
     def test_csv_row_count_includes_endpoint(
         self, scheduling_input: dict[str, Any]
     ) -> None:
-        """24 intervals → 25 rows (24 + endpoint) + 1 header = 26 lines."""
+        """24 intervals → 26 rows (1 dummy + 24 + endpoint) + 1 header = 27 lines."""
         result = translate_scheduling(scheduling_input)
         lines = result.timeseries_csv.strip().splitlines()
-        assert len(lines) == 26
+        assert len(lines) == 27
 
     def test_initial_soc_extracted(self, scheduling_input: dict[str, Any]) -> None:
         result = translate_scheduling(scheduling_input)

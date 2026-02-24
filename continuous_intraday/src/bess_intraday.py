@@ -34,8 +34,8 @@ class BESSIntraday(
     def solver_options(self):
         """Configure solver options for mixed-integer optimization."""
         options = super().solver_options()
-        options['casadi_solver'] = 'qpsol'
-        options['solver'] = 'highs'
+        options["casadi_solver"] = "qpsol"
+        options["solver"] = "highs"
         return options
 
     def pre(self):
@@ -44,7 +44,7 @@ class BESSIntraday(
 
         # Get number of orderbook entries from parameters
         params = self.parameters(0)
-        self.n_entries = int(params['n_orderbook_entries'])
+        self.n_entries = int(params["n_orderbook_entries"])
 
     def path_objective(self, ensemble_member):
         """
@@ -58,8 +58,8 @@ class BESSIntraday(
         total_discharge = 0.0
         discharge_revenue = 0.0
         for i in range(self.n_entries):
-            bid_price = self.state(f'bid_prices[{i+1}]')
-            discharge_power_i = self.state(f'discharge_power_bids[{i+1}]')
+            bid_price = self.state(f"bid_prices[{i + 1}]")
+            discharge_power_i = self.state(f"discharge_power_bids[{i + 1}]")
             total_discharge += discharge_power_i
             discharge_revenue += bid_price * discharge_power_i
 
@@ -67,8 +67,8 @@ class BESSIntraday(
         total_charge = 0.0
         charge_cost = 0.0
         for i in range(self.n_entries):
-            ask_price = self.state(f'ask_prices[{i+1}]')
-            charge_power_i = self.state(f'charge_power_asks[{i+1}]')
+            ask_price = self.state(f"ask_prices[{i + 1}]")
+            charge_power_i = self.state(f"charge_power_asks[{i + 1}]")
             total_charge += charge_power_i
             charge_cost += ask_price * charge_power_i
 
@@ -89,42 +89,53 @@ class BESSIntraday(
         parameters = self.parameters(ensemble_member)
 
         # Ensure only one mode can be active at a time (complementarity)
-        constraints.append((
-            self.state('is_charging') +
-            self.state('is_discharging'),
-            -np.inf,
-            1.0,
-        ))
-        constraints.append((
-            self.state('charge_power') -
-            self.state('is_charging') * parameters["max_power"],
-            -np.inf,
-            0,
-        ))
-        constraints.append((
-            self.state('discharge_power') -
-            self.state('is_discharging') * parameters["max_power"],
-            -np.inf,
-            0,
-        ))
+        constraints.append(
+            (
+                self.state("is_charging") + self.state("is_discharging"),
+                -np.inf,
+                1.0,
+            )
+        )
+        constraints.append(
+            (
+                self.state("charge_power")
+                - self.state("is_charging") * parameters["max_power"],
+                -np.inf,
+                0,
+            )
+        )
+        constraints.append(
+            (
+                self.state("discharge_power")
+                - self.state("is_discharging") * parameters["max_power"],
+                -np.inf,
+                0,
+            )
+        )
 
         # Power allocated to each level cannot exceed available volume
         for i in range(self.n_entries):
             # Discharge limited by bid volume: discharge_power_bids[i] <= bid_volumes[i]
             # Reformulated as: discharge_power_bids[i] - bid_volumes[i] <= 0
-            constraints.append((
-                self.state(f'discharge_power_bids[{i+1}]') - self.state(f'bid_volumes[{i+1}]'),
-                -np.inf,
-                0.0,
-            ))
+            constraints.append(
+                (
+                    self.state(f"discharge_power_bids[{i + 1}]")
+                    - self.state(f"bid_volumes[{i + 1}]"),
+                    -np.inf,
+                    0.0,
+                )
+            )
 
             # Charge limited by ask volume: charge_power_asks[i] <= ask_volumes[i]
             # Reformulated as: charge_power_asks[i] - ask_volumes[i] <= 0
-            constraints.append((
-                self.state(f'charge_power_asks[{i+1}]') - self.state(f'ask_volumes[{i+1}]'),
-                -np.inf,
-                0.0,
-            ))
+            constraints.append(
+                (
+                    self.state(f"charge_power_asks[{i + 1}]")
+                    - self.state(f"ask_volumes[{i + 1}]"),
+                    -np.inf,
+                    0.0,
+                )
+            )
 
         return constraints
 
@@ -134,7 +145,9 @@ class BESSIntraday(
 
         print("Optimization completed successfully!")
         print("Results saved to output/timeseries_export.csv")
-        print("Run 'uv run python src/plot_results.py' to generate plots and summary statistics.")
+        print(
+            "Run 'uv run python src/plot_results.py' to generate plots and summary statistics."
+        )
 
 
 if __name__ == "__main__":

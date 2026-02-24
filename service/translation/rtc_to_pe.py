@@ -51,11 +51,13 @@ def translate_scheduling_result(
     """
     df = _read_output_csv(output_dir)
 
-    # Filter to original interval count (exclude endpoint row)
+    # Strip the prepended dummy row (front) and endpoint row (back).
+    # The translation layer prepends one dummy timestep so that backward
+    # Euler's blind-spot at t=0 falls outside the real trading window.
     interval_start = model_input.get("interval_start", [])
     n = len(interval_start)
     if len(df) > n:
-        df = df.iloc[:n].reset_index(drop=True)
+        df = df.iloc[1 : n + 1].reset_index(drop=True)
 
     # Use the original interval_start timestamps for SOC times
     soc_times = list(interval_start)
@@ -102,11 +104,11 @@ def translate_intraday_result(
     """
     df = _read_output_csv(output_dir)
 
-    # Filter to original interval count (exclude endpoint row)
+    # Strip the prepended dummy row (front) and endpoint row (back).
     interval_start = model_input.get("interval_start", [])
     n = len(interval_start)
     if len(df) > n:
-        df = df.iloc[:n].reset_index(drop=True)
+        df = df.iloc[1 : n + 1].reset_index(drop=True)
 
     soc_times = list(interval_start)
 

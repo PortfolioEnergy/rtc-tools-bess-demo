@@ -9,7 +9,7 @@ from __future__ import annotations
 import io
 import csv
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -52,6 +52,29 @@ def _iso_to_csv_time(iso_str: str) -> str:
     dt = datetime.fromisoformat(cleaned)
     # RTC-Tools expects naive timestamps — strip tz
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _compute_interval_step(interval_start: list[str]) -> timedelta:
+    """Infer the interval duration from the first two ``interval_start`` entries."""
+    if len(interval_start) >= 2:
+        t0 = datetime.fromisoformat(interval_start[0].replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(interval_start[1].replace("Z", "+00:00"))
+        return t1 - t0
+    return timedelta(minutes=15)
+
+
+def _prepend_dummy_time(interval_start: list[str]) -> str:
+    """Return a CSV-format timestamp one interval step before the first entry.
+
+    RTC-Tools' backward Euler (theta=1) leaves controls at the first
+    collocation point decoupled from the SoC dynamics.  Prepending one
+    dummy timestep shifts the initial-state boundary to *before* the
+    trading window so that every real PTU has a proper SoC transition.
+    """
+    step = _compute_interval_step(interval_start)
+    first = datetime.fromisoformat(interval_start[0].replace("Z", "+00:00"))
+    dummy = first - step
+    return dummy.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _has_nonzero(values: list[float] | None) -> bool:
@@ -163,7 +186,12 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
     # ── build CSVs ──
 
     # timeseries_import.csv — time,price
-    # RTC-Tools needs one extra row at the end (the endpoint)
+    #
+    # RTC-Tools needs one extra row at the end (the endpoint) and we
+    # prepend one dummy row so that the initial SoC sits one interval
+    # *before* the trading window.  With backward Euler the first
+    # collocation point's controls are decoupled from SoC dynamics;
+    # the dummy row absorbs that blind-spot harmlessly.
     times = [_iso_to_csv_time(t) for t in interval_start]
     if interval_end:
         times.append(_iso_to_csv_time(interval_end[-1]))
@@ -172,6 +200,11 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
     padded_prices = list(prices)
     if padded_prices and len(padded_prices) < len(times):
         padded_prices.append(padded_prices[-1])
+
+    # Prepend dummy row — price=0 so the optimizer earns nothing there
+    if interval_start:
+        times.insert(0, _prepend_dummy_time(interval_start))
+        padded_prices.insert(0, 0.0)
 
     rows = [
         [times[i], padded_prices[i] if i < len(padded_prices) else 0.0]
@@ -327,6 +360,8 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
     # timeseries_import.csv
     # Columns: time, committed_net_power, bid_prices[1..N], ask_prices[1..N],
     #          bid_volumes[1..N], ask_volumes[1..N]
+    #
+    # We prepend one dummy row (see translate_scheduling for rationale).
     times = [_iso_to_csv_time(t) for t in interval_start]
     if interval_end:
         times.append(_iso_to_csv_time(interval_end[-1]))
@@ -359,6 +394,13 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
             # Endpoint row — repeat last
             values.append(values[-1])
             orderbook_columns[csv_name] = values
+
+    # Prepend dummy row — zero volumes so no trading is possible there
+    if interval_start:
+        times.insert(0, _prepend_dummy_time(interval_start))
+        padded_pos.insert(0, 0.0)
+        for csv_name, values in orderbook_columns.items():
+            values.insert(0, 0.0)
 
     # Build header and rows
     header = ["time", "committed_net_power"]
