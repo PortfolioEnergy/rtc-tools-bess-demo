@@ -16,6 +16,7 @@ RUN uv sync --frozen --no-install-project --group service
 COPY service/ service/
 COPY scheduling/ scheduling/
 COPY continuous_intraday/ continuous_intraday/
+COPY README.md ./
 
 # Install the project itself
 RUN uv sync --frozen --group service
