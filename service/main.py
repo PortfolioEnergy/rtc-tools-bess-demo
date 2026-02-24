@@ -7,6 +7,7 @@ import logging
 import uvicorn
 from fastapi import FastAPI
 
+from service.otel_setup import setup_otel
 from service.routes import router
 
 logging.basicConfig(
@@ -27,6 +28,7 @@ app = FastAPI(
 )
 
 app.include_router(router)
+setup_otel(app)
 
 
 @app.get("/health")
@@ -52,4 +54,4 @@ def ready() -> dict[str, str]:
 def start() -> None:
     """Entry point for ``bess-service`` console script."""
     _log.info("Starting RTC-Tools BESS Optimizer Service on port 8010")
-    uvicorn.run("service.main:app", host="0.0.0.0", port=8010)
+    uvicorn.run("service.main:app", host="0.0.0.0", port=8010, access_log=False)
