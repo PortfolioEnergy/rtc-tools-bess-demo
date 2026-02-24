@@ -195,13 +195,25 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
 
     parameters_csv = _write_csv(param_header, [param_row]) if param_header else None
 
+    # Convert cost_per_cycle (EUR/cycle) to cycling_penalty_factor (EUR/MWh throughput).
+    # A full cycle = charge capacity + discharge capacity = 2 * capacity MWh throughput.
+    if cost_per_cycle is not None and capacity is not None and capacity > 0:
+        cycling_penalty_factor = cost_per_cycle / (2.0 * capacity)
+        info.append(
+            f"approximation: 'cost_per_cycle' ({cost_per_cycle} EUR/cycle) converted to "
+            f"cycling_penalty_factor = {cycling_penalty_factor:.4f} EUR/MWh "
+            f"using cost_per_cycle / (2 * capacity)"
+        )
+    else:
+        cycling_penalty_factor = cost_per_cycle if cost_per_cycle is not None else 2.0
+
     info.append("solver: using HiGHS MILP via RTC-Tools (PE API solver may differ)")
 
     return TranslationResult(
         timeseries_csv=timeseries_csv,
         initial_state_csv=initial_state_csv,
         parameters_csv=parameters_csv,
-        cycling_penalty=cost_per_cycle if cost_per_cycle is not None else 2.0,
+        cycling_penalty=cycling_penalty_factor,
         transaction_cost=0.0,
         n_segments=0,
         info=info,
@@ -386,13 +398,25 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
 
     parameters_csv = _write_csv(param_header, [param_row]) if param_header else None
 
+    # Convert cost_per_cycle (EUR/cycle) to cycling_penalty_factor (EUR/MWh throughput).
+    # A full cycle = charge capacity + discharge capacity = 2 * capacity MWh throughput.
+    if cost_per_cycle is not None and capacity is not None and capacity > 0:
+        cycling_penalty_factor = cost_per_cycle / (2.0 * capacity)
+        info.append(
+            f"approximation: 'cost_per_cycle' ({cost_per_cycle} EUR/cycle) converted to "
+            f"cycling_penalty_factor = {cycling_penalty_factor:.4f} EUR/MWh "
+            f"using cost_per_cycle / (2 * capacity)"
+        )
+    else:
+        cycling_penalty_factor = cost_per_cycle if cost_per_cycle is not None else 2.0
+
     info.append("solver: using HiGHS MILP via RTC-Tools (PE API solver may differ)")
 
     return TranslationResult(
         timeseries_csv=timeseries_csv,
         initial_state_csv=initial_state_csv,
         parameters_csv=parameters_csv,
-        cycling_penalty=cost_per_cycle if cost_per_cycle is not None else 2.0,
+        cycling_penalty=cycling_penalty_factor,
         transaction_cost=0.05,
         n_segments=n_segments,
         info=info,

@@ -105,6 +105,19 @@ class TestTranslateScheduling:
         solver_lines = [i for i in result.info if "solver:" in i]
         assert len(solver_lines) >= 1
 
+    def test_cycling_penalty_converted_from_cost_per_cycle(
+        self, scheduling_input: dict[str, Any]
+    ) -> None:
+        """cost_per_cycle / (2 * capacity) = 2.0 / (2 * 20.0) = 0.05."""
+        result = translate_scheduling(scheduling_input)
+        assert result.cycling_penalty == pytest.approx(0.05)
+        conversion_msgs = [
+            i
+            for i in result.info
+            if "cost_per_cycle" in i and "cycling_penalty_factor" in i
+        ]
+        assert len(conversion_msgs) == 1
+
     def test_no_parameters_csv_when_no_overrides(
         self, scheduling_input: dict[str, Any]
     ) -> None:
@@ -151,7 +164,23 @@ class TestTranslateIntraday:
         result = translate_intraday(intraday_input)
         assert result.transaction_cost == 0.05
 
-    def test_cycling_penalty_from_input(self, intraday_input: dict[str, Any]) -> None:
+    def test_cycling_penalty_converted_from_cost_per_cycle(
+        self, intraday_input: dict[str, Any]
+    ) -> None:
+        """cost_per_cycle / (2 * capacity) = 2.0 / (2 * 20.0) = 0.05."""
+        result = translate_intraday(intraday_input)
+        assert result.cycling_penalty == pytest.approx(0.05)
+        conversion_msgs = [
+            i
+            for i in result.info
+            if "cost_per_cycle" in i and "cycling_penalty_factor" in i
+        ]
+        assert len(conversion_msgs) == 1
+
+    def test_cycling_penalty_passthrough_without_capacity(
+        self, intraday_input: dict[str, Any]
+    ) -> None:
+        """Without capacity, cost_per_cycle is passed through unchanged."""
         intraday_input["parameters"] = [
             {"name": "cost_per_cycle", "value": 5.0},
         ]
