@@ -15,6 +15,10 @@ model BESSIntraday
   Boolean is_charging "True if battery is charging";
   Boolean is_discharging "True if battery is discharging";
 
+  // Input variables - grid fees
+  input Real grid_fee_in(fixed = true) "Grid fee for importing power in $/MWh";
+  input Real grid_fee_out(fixed = true) "Grid fee for exporting power in $/MWh";
+
   // Input variables - committed net position from day ahead and prior intraday trades
   input Real committed_net_power(fixed = true) "Committed net power from prior trades (MW, positive=discharge, negative=charge)";
 

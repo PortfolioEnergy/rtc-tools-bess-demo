@@ -105,6 +105,12 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
     price_ts = _find_timeseries(model_input, "day_ahead_price")
     prices = price_ts["values"] if price_ts else []
 
+    grid_fee_in_ts = _find_timeseries(model_input, "grid_fee_in")
+    grid_fee_in_values = grid_fee_in_ts["values"] if grid_fee_in_ts else []
+
+    grid_fee_out_ts = _find_timeseries(model_input, "grid_fee_out")
+    grid_fee_out_values = grid_fee_out_ts["values"] if grid_fee_out_ts else []
+
     soc_ts = _find_timeseries(model_input, "state_of_charge")
     initial_soc = soc_ts["values"][0] if soc_ts and soc_ts.get("values") else 0.0
 
@@ -201,16 +207,51 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
     if padded_prices and len(padded_prices) < len(times):
         padded_prices.append(padded_prices[-1])
 
-    # Prepend dummy row — price=0 so the optimizer earns nothing there
+    # Pad grid fees to match times length, defaulting to 0.0
+    n_intervals = len(interval_start)
+
+    padded_fee_in = (
+        list(grid_fee_in_values) if grid_fee_in_values else [0.0] * n_intervals
+    )
+    while len(padded_fee_in) < n_intervals:
+        padded_fee_in.append(0.0)
+    padded_fee_in.append(padded_fee_in[-1] if padded_fee_in else 0.0)
+
+    padded_fee_out = (
+        list(grid_fee_out_values) if grid_fee_out_values else [0.0] * n_intervals
+    )
+    while len(padded_fee_out) < n_intervals:
+        padded_fee_out.append(0.0)
+    padded_fee_out.append(padded_fee_out[-1] if padded_fee_out else 0.0)
+
+    if _has_nonzero(grid_fee_in_values):
+        info.append(
+            f"applied: 'grid_fee_in' timeseries ({len(grid_fee_in_values)} values) "
+            f"— subtracted from charging revenue in objective"
+        )
+    if _has_nonzero(grid_fee_out_values):
+        info.append(
+            f"applied: 'grid_fee_out' timeseries ({len(grid_fee_out_values)} values) "
+            f"— subtracted from discharging revenue in objective"
+        )
+
+    # Prepend dummy row — price=0 and fees=0 so the optimizer earns nothing there
     if interval_start:
         times.insert(0, _prepend_dummy_time(interval_start))
         padded_prices.insert(0, 0.0)
+        padded_fee_in.insert(0, 0.0)
+        padded_fee_out.insert(0, 0.0)
 
     rows = [
-        [times[i], padded_prices[i] if i < len(padded_prices) else 0.0]
+        [
+            times[i],
+            padded_prices[i] if i < len(padded_prices) else 0.0,
+            padded_fee_in[i],
+            padded_fee_out[i],
+        ]
         for i in range(len(times))
     ]
-    timeseries_csv = _write_csv(["time", "price"], rows)
+    timeseries_csv = _write_csv(["time", "price", "grid_fee_in", "grid_fee_out"], rows)
 
     # initial_state.csv
     initial_state_csv = _write_csv(["soc"], [[initial_soc]])
@@ -291,6 +332,12 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
     # ── timeseries ──
     market_pos_ts = _find_timeseries(model_input, "market_position")
     market_position = market_pos_ts["values"] if market_pos_ts else []
+
+    grid_fee_in_ts = _find_timeseries(model_input, "grid_fee_in")
+    grid_fee_in_values = grid_fee_in_ts["values"] if grid_fee_in_ts else []
+
+    grid_fee_out_ts = _find_timeseries(model_input, "grid_fee_out")
+    grid_fee_out_values = grid_fee_out_ts["values"] if grid_fee_out_ts else []
 
     soc_ts = _find_timeseries(model_input, "state_of_charge")
     initial_soc = soc_ts["values"][0] if soc_ts and soc_ts.get("values") else 0.0
@@ -375,6 +422,32 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
     # Add endpoint row
     padded_pos.append(padded_pos[-1] if padded_pos else 0.0)
 
+    # Pad grid fees to match intervals, defaulting to 0.0
+    padded_fee_in = (
+        list(grid_fee_in_values) if grid_fee_in_values else [0.0] * n_intervals
+    )
+    while len(padded_fee_in) < n_intervals:
+        padded_fee_in.append(0.0)
+    padded_fee_in.append(padded_fee_in[-1] if padded_fee_in else 0.0)
+
+    padded_fee_out = (
+        list(grid_fee_out_values) if grid_fee_out_values else [0.0] * n_intervals
+    )
+    while len(padded_fee_out) < n_intervals:
+        padded_fee_out.append(0.0)
+    padded_fee_out.append(padded_fee_out[-1] if padded_fee_out else 0.0)
+
+    if _has_nonzero(grid_fee_in_values):
+        info.append(
+            f"applied: 'grid_fee_in' timeseries ({len(grid_fee_in_values)} values) "
+            f"— subtracted from charging revenue in objective"
+        )
+    if _has_nonzero(grid_fee_out_values):
+        info.append(
+            f"applied: 'grid_fee_out' timeseries ({len(grid_fee_out_values)} values) "
+            f"— subtracted from discharging revenue in objective"
+        )
+
     # Collect orderbook columns
     orderbook_columns: dict[str, list[float]] = {}
     for seg in range(1, n_segments + 1):
@@ -399,11 +472,13 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
     if interval_start:
         times.insert(0, _prepend_dummy_time(interval_start))
         padded_pos.insert(0, 0.0)
+        padded_fee_in.insert(0, 0.0)
+        padded_fee_out.insert(0, 0.0)
         for csv_name, values in orderbook_columns.items():
             values.insert(0, 0.0)
 
     # Build header and rows
-    header = ["time", "committed_net_power"]
+    header = ["time", "committed_net_power", "grid_fee_in", "grid_fee_out"]
     for seg in range(1, n_segments + 1):
         header.extend(
             [
@@ -416,7 +491,7 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
 
     rows: list[list[Any]] = []
     for i in range(len(times)):
-        row: list[Any] = [times[i], padded_pos[i]]
+        row: list[Any] = [times[i], padded_pos[i], padded_fee_in[i], padded_fee_out[i]]
         for seg in range(1, n_segments + 1):
             row.append(orderbook_columns[f"bid_prices[{seg}]"][i])
             row.append(orderbook_columns[f"ask_prices[{seg}]"][i])

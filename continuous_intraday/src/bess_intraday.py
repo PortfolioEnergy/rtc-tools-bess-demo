@@ -72,6 +72,12 @@ class BESSIntraday(
             total_charge += charge_power_i
             charge_cost += ask_price * charge_power_i
 
+        # Grid fees on power exchanged with the grid
+        grid_fee_cost = (
+            self.state("grid_fee_in") * total_charge
+            + self.state("grid_fee_out") * total_discharge
+        )
+
         # Transaction costs on total traded volume
         transaction_cost = self.transaction_cost * (total_charge + total_discharge)
 
@@ -79,7 +85,13 @@ class BESSIntraday(
         cycling_penalty = self.cycling_penalty_factor * (total_charge + total_discharge)
 
         # Total objective (negative because we want to maximize profit)
-        profit = discharge_revenue - charge_cost - transaction_cost - cycling_penalty
+        profit = (
+            discharge_revenue
+            - charge_cost
+            - grid_fee_cost
+            - transaction_cost
+            - cycling_penalty
+        )
         return -profit
 
     def path_constraints(self, ensemble_member):

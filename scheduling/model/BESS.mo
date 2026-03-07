@@ -16,6 +16,8 @@ model BESS
   
   // Input variables
   input Real price(fixed = true) "Electricity price in $/MWh";
+  input Real grid_fee_in(fixed = true) "Grid fee for importing power in $/MWh";
+  input Real grid_fee_out(fixed = true) "Grid fee for exporting power in $/MWh";
   
 equation
   // State of charge dynamics

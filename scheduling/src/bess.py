@@ -45,13 +45,18 @@ class BESS(
         # Revenue from energy arbitrage
         revenue = self.state("net_power") * self.state("price")
 
+        # Grid fees on power exchanged with the grid
+        grid_fee_cost = self.state("grid_fee_in") * self.state(
+            "charge_power"
+        ) + self.state("grid_fee_out") * self.state("discharge_power")
+
         # Cycling penalty based on total power throughput
         cycling_penalty = self.cycling_penalty_factor * (
             self.state("charge_power") + self.state("discharge_power")
         )
 
         # Total objective (negative because we want to maximize)
-        return -(revenue - cycling_penalty)
+        return -(revenue - grid_fee_cost - cycling_penalty)
 
     def path_constraints(self, ensemble_member):
         """Define path constraints (inequality constraints over time)."""
