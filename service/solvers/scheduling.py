@@ -27,6 +27,10 @@ class ConfigurableBESS(BESS):
     overridden via ``parameters.csv``.  ``cycling_penalty_factor`` and
     ``stored_energy_value`` need Python-level overrides because they are
     not Modelica parameters.
+
+    The ``objective()`` override with terminal SoC valuation lives in the
+    base ``BESS`` class.  This subclass only needs to inject the per-request
+    values via class attributes before instantiation.
     """
 
     _cycling_penalty: float = 2.0
@@ -36,27 +40,6 @@ class ConfigurableBESS(BESS):
         super().__init__(**kwargs)
         self.cycling_penalty_factor = self.__class__._cycling_penalty
         self.stored_energy_value = self.__class__._stored_energy_value
-
-    def objective(self, ensemble_member):
-        """Add terminal SoC valuation to the objective.
-
-        The ``stored_energy_value`` (EUR/MWh) rewards energy remaining in
-        the battery at the end of the optimisation horizon, preventing
-        the solver from greedily draining the battery when future trading
-        opportunities exist beyond the current window.
-
-        RTC-Tools plain-sums ``path_objective`` over collocation points
-        without multiplying by dt, so rates in EUR/h are effectively
-        inflated by ``1/dt_hours``.  The terminal value must be scaled
-        by the same factor to be comparable in magnitude.
-        """
-        obj = super().objective(ensemble_member)
-        if self.stored_energy_value != 0.0:
-            times = self.times()
-            dt_hours = (times[1] - times[0]) / 3600.0
-            soc_final = self.state_at("soc", times[-1], ensemble_member)
-            obj -= (self.stored_energy_value / dt_hours) * soc_final
-        return obj
 
     def post(self):
         # Skip the demo's print statements — we read CSV output directly

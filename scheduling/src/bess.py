@@ -27,6 +27,9 @@ class BESS(
         super().__init__(**kwargs)
         # Economic parameters (not in Modelica model)
         self.cycling_penalty_factor = 0.1  # $/MWh cycling penalty
+        self.stored_energy_value = (
+            0.0  # EUR/MWh value assigned to SoC remaining at horizon end
+        )
 
     def solver_options(self):
         """Configure solver options for mixed-integer optimization."""
@@ -57,6 +60,27 @@ class BESS(
 
         # Total objective (negative because we want to maximize)
         return -(revenue - grid_fee_cost - cycling_penalty)
+
+    def objective(self, ensemble_member):
+        """Add terminal SoC valuation to the path objective total.
+
+        When ``stored_energy_value`` is non-zero (EUR/MWh), the solver is
+        rewarded for energy remaining in the battery at the end of the
+        optimisation horizon.  This prevents greedy end-of-horizon draining
+        when future trading opportunities exist beyond the current window.
+
+        RTC-Tools plain-sums ``path_objective`` over collocation points
+        without multiplying by dt, so rates in EUR/h are effectively
+        inflated by ``1/dt_hours``.  The terminal value must be scaled
+        by the same factor to remain comparable in magnitude.
+        """
+        obj = super().objective(ensemble_member)
+        if self.stored_energy_value != 0.0:
+            times = self.times()
+            dt_hours = (times[1] - times[0]) / 3600.0
+            soc_final = self.state_at("soc", times[-1], ensemble_member)
+            obj -= (self.stored_energy_value / dt_hours) * soc_final
+        return obj
 
     def path_constraints(self, ensemble_member):
         """Define path constraints (inequality constraints over time)."""

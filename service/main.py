@@ -14,6 +14,19 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
+
+# pymoca uses its own top-level logger ("pymoca") that is independent of the
+# "rtctools" logger.  It inherits from root (INFO by default), which produces
+# ~15 noisy compilation lines per model build even when the pymoca disk cache
+# is warm.  Limit it to warnings only.
+logging.getLogger("pymoca").setLevel(logging.WARNING)
+
+# rtctools adds its own StreamHandler to the "rtctools" logger on the first
+# run_optimization_problem() call.  Without propagate=False that handler would
+# fire in addition to the root handler configured by basicConfig above,
+# causing every rtctools WARNING/ERROR to appear twice in the output.
+logging.getLogger("rtctools").propagate = False
+
 _log = logging.getLogger(__name__)
 
 app = FastAPI(

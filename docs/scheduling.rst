@@ -33,7 +33,7 @@ The BESS optimisation problem can be formulated as follows:
 
 .. math::
 
-   \max \sum_{t} \left( P_{net}(t) \cdot \pi(t) - \lambda \cdot (P_{charge}(t) + P_{discharge}(t)) \right)
+   \max \sum_{t} \left( P_{net}(t) \cdot \pi(t) - \lambda \cdot (P_{charge}(t) + P_{discharge}(t)) \right) + \nu \cdot SoC(T)
 
 Where:
    * :math:`P_{net}(t) = P_{discharge}(t) - P_{charge}(t)` = Net power (positive for discharge, negative for charge)
@@ -41,6 +41,10 @@ Where:
    * :math:`\lambda` = Cycling penalty factor (requires tuning based on market conditions; annual revision is a reasonable starting point)
    * :math:`P_{charge}(t)` = Charging power
    * :math:`P_{discharge}(t)` = Discharging power
+   * :math:`\nu` = Terminal SoC value (EUR/MWh); rewards energy stored at the end of the horizon
+   * :math:`SoC(T)` = State of charge at the final time step :math:`T`
+
+The terminal SoC term :math:`\nu \cdot SoC(T)` prevents the optimiser from greedily draining the battery at the end of the planning horizon when future trading opportunities exist.  Set :math:`\nu = 0` (the default) to disable it.
 
 **State of Charge Dynamics:**
 
@@ -132,6 +136,14 @@ The objective function demonstrates the value stream modeling:
 * **Revenue Stream**: ``net_power * price`` - income from energy arbitrage
 * **Cost Stream**: ``cycling_penalty_factor * (charge_power + discharge_power)`` - operational costs
 * **Optimization Goal**: Maximize net profit (revenue minus costs)
+
+**Terminal SoC Valuation:**
+
+.. literalinclude:: ../scheduling/src/bess.py
+   :language: python
+   :pyobject: BESS.objective
+
+Setting ``stored_energy_value`` to a non-zero EUR/MWh figure (e.g. the expected average spread for the next trading window) prevents the solver from draining the battery to zero purely because the horizon ends.  The default value is ``0.0`` (disabled).
 
 **Solver Configuration:**
 

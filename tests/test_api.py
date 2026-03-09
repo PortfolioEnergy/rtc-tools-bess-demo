@@ -73,32 +73,91 @@ class TestSubmitSync:
         self, client: TestClient, scheduling_input: dict[str, Any]
     ) -> None:
         """Verify that a scheduling model name reaches run_solver with 'scheduling'."""
-        mock_result = {
-            "members": {"default": {}},
-            "_info": ["solver: mock"],
+        mock_body = {
+            "result": {"members": {"default": {}}, "_info": ["solver: mock"]},
         }
-        with patch("service.routes.run_solver", return_value=mock_result) as mock:
+        with patch("service.routes.run_solver", return_value=mock_body) as mock:
             resp = client.post(
                 "/v1/models/bess_day_ahead/submit_sync",
                 json={"model_input_data": scheduling_input},
             )
             assert resp.status_code == 200
-            mock.assert_called_once_with("scheduling", scheduling_input)
+            mock.assert_called_once_with(
+                "scheduling", scheduling_input, include_diagnostics=False
+            )
 
     def test_intraday_model_dispatches_correctly(
         self, client: TestClient, intraday_input: dict[str, Any]
     ) -> None:
-        mock_result = {
-            "members": {"default": {}},
-            "_info": ["solver: mock"],
+        mock_body = {
+            "result": {"members": {"default": {}}, "_info": ["solver: mock"]},
         }
-        with patch("service.routes.run_solver", return_value=mock_result) as mock:
+        with patch("service.routes.run_solver", return_value=mock_body) as mock:
             resp = client.post(
                 "/v1/models/bess_rolling/submit_sync",
                 json={"model_input_data": intraday_input},
             )
             assert resp.status_code == 200
-            mock.assert_called_once_with("intraday", intraday_input)
+            mock.assert_called_once_with(
+                "intraday", intraday_input, include_diagnostics=False
+            )
+
+    def test_include_diagnostics_flag_forwarded(
+        self, client: TestClient, scheduling_input: dict[str, Any]
+    ) -> None:
+        """include_diagnostics=True must be forwarded to run_solver."""
+        mock_body = {
+            "result": {"members": {"default": {}}, "_info": ["solver: mock"]},
+        }
+        with patch("service.routes.run_solver", return_value=mock_body) as mock:
+            resp = client.post(
+                "/v1/models/bess_day_ahead/submit_sync",
+                json={
+                    "model_input_data": scheduling_input,
+                    "include_diagnostics": True,
+                },
+            )
+            assert resp.status_code == 200
+            mock.assert_called_once_with(
+                "scheduling", scheduling_input, include_diagnostics=True
+            )
+
+    def test_images_present_when_diagnostics_returned(
+        self, client: TestClient, setpoints_input: dict[str, Any]
+    ) -> None:
+        """When diagnostics are enabled, chart data URIs appear inside ``_info``
+        as ``"image:<name>: data:image/png;base64,..."`` entries.
+
+        The response shape (``result`` with ``members`` + ``_info``) is
+        unchanged — no top-level ``images`` key is added.
+        """
+        mock_body = {
+            "result": {
+                "members": {"default": {"setpoints": {"values": [1.0]}}},
+                "_info": [
+                    "solver: mock",
+                    "image:revenue_decomposition: data:image/png;base64,xyz",
+                ],
+            },
+        }
+        with patch("service.routes.run_solver", return_value=mock_body):
+            resp = client.post(
+                "/v1/models/bess_setpoints/submit_sync",
+                json={
+                    "model_input_data": setpoints_input,
+                    "include_diagnostics": True,
+                },
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            info = body["result"]["_info"]
+            image_entries = [e for e in info if e.startswith("image:")]
+            assert len(image_entries) == 1
+            assert "revenue_decomposition" in image_entries[0]
+            assert "data:image/png;base64," in image_entries[0]
+            # no top-level images key and no images key inside result
+            assert "images" not in body
+            assert "images" not in body["result"]
 
     def test_solver_error_returns_500(
         self, client: TestClient, scheduling_input: dict[str, Any]

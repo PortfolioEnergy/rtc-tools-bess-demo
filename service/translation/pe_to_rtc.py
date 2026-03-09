@@ -415,12 +415,37 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
 
     n_intervals = len(interval_start)
 
-    # Pad market_position
-    padded_pos = list(market_position) if market_position else [0.0] * n_intervals
-    if len(padded_pos) < n_intervals:
-        padded_pos.extend([0.0] * (n_intervals - len(padded_pos)))
-    # Add endpoint row
-    padded_pos.append(padded_pos[-1] if padded_pos else 0.0)
+    # Decompose committed_net_power (market_position) into two non-negative
+    # components so the Modelica model can apply efficiency losses to each
+    # gross power flow independently.
+    #
+    # When the committed position and incremental intraday trades partially
+    # offset (e.g. committed discharge + new charge order), computing SoC
+    # dynamics from the net would underestimate efficiency losses because:
+    #   net_efficiency_loss(P_net) < gross_loss(P_discharge) + gross_loss(P_charge)
+    #
+    # By splitting here (fixed input, no solver non-linearity) the Modelica
+    # equations receive:
+    #   charge_power   = committed_charge   + sum(charge_power_asks)
+    #   discharge_power = committed_discharge + sum(discharge_power_bids)
+    # and der(soc) is computed on those gross values.
+    raw_pos = list(market_position) if market_position else [0.0] * n_intervals
+    if len(raw_pos) < n_intervals:
+        raw_pos.extend([0.0] * (n_intervals - len(raw_pos)))
+    # Add endpoint row (repeat last value)
+    raw_pos.append(raw_pos[-1] if raw_pos else 0.0)
+
+    # Non-negative committed flows
+    padded_committed_charge = [max(0.0, -v) for v in raw_pos]  # net < 0 → charging
+    padded_committed_discharge = [max(0.0, v) for v in raw_pos]  # net > 0 → discharging
+
+    if any(v != 0.0 for v in raw_pos):
+        info.append(
+            "applied: 'market_position' decomposed into 'committed_charge' and "
+            "'committed_discharge' for gross-flow SoC tracking — prevents "
+            "underestimating efficiency losses when committed position and "
+            "incremental trades partially offset"
+        )
 
     # Pad grid fees to match intervals, defaulting to 0.0
     padded_fee_in = (
@@ -471,14 +496,21 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
     # Prepend dummy row — zero volumes so no trading is possible there
     if interval_start:
         times.insert(0, _prepend_dummy_time(interval_start))
-        padded_pos.insert(0, 0.0)
+        padded_committed_charge.insert(0, 0.0)
+        padded_committed_discharge.insert(0, 0.0)
         padded_fee_in.insert(0, 0.0)
         padded_fee_out.insert(0, 0.0)
         for csv_name, values in orderbook_columns.items():
             values.insert(0, 0.0)
 
     # Build header and rows
-    header = ["time", "committed_net_power", "grid_fee_in", "grid_fee_out"]
+    header = [
+        "time",
+        "committed_charge",
+        "committed_discharge",
+        "grid_fee_in",
+        "grid_fee_out",
+    ]
     for seg in range(1, n_segments + 1):
         header.extend(
             [
@@ -491,7 +523,13 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
 
     rows: list[list[Any]] = []
     for i in range(len(times)):
-        row: list[Any] = [times[i], padded_pos[i], padded_fee_in[i], padded_fee_out[i]]
+        row: list[Any] = [
+            times[i],
+            padded_committed_charge[i],
+            padded_committed_discharge[i],
+            padded_fee_in[i],
+            padded_fee_out[i],
+        ]
         for seg in range(1, n_segments + 1):
             row.append(orderbook_columns[f"bid_prices[{seg}]"][i])
             row.append(orderbook_columns[f"ask_prices[{seg}]"][i])

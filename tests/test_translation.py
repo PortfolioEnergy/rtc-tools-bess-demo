@@ -200,13 +200,99 @@ class TestTranslateIntraday:
     def test_csv_has_orderbook_columns(self, intraday_input: dict[str, Any]) -> None:
         result = translate_intraday(intraday_input)
         header = result.timeseries_csv.splitlines()[0]
-        assert "committed_net_power" in header
+        # committed_net_power has been split into two non-negative columns
+        assert "committed_charge" in header
+        assert "committed_discharge" in header
+        assert "committed_net_power" not in header
         assert "grid_fee_in" in header
         assert "grid_fee_out" in header
         assert "bid_prices[1]" in header
         assert "ask_prices[1]" in header
         assert "bid_volumes[1]" in header
         assert "ask_volumes[1]" in header
+
+    def test_committed_position_decomposed_correctly(
+        self, intraday_input: dict[str, Any]
+    ) -> None:
+        """market_position values are split into non-negative charge/discharge columns.
+
+        Positive net  = discharging: committed_discharge > 0, committed_charge = 0
+        Negative net  = charging:    committed_charge > 0,    committed_discharge = 0
+        Zero net      = idle:        both are 0
+        """
+        n = 8
+        # Mix of positive (discharge), negative (charge), and zero positions
+        positions = [5.0, -3.0, 0.0, 10.0, -7.5, 0.0, 2.0, -1.0]
+        intraday_input["timeseries"] = [
+            ts
+            for ts in intraday_input["timeseries"]
+            if ts.get("name") != "market_position"
+        ]
+        intraday_input["timeseries"].append(
+            {"name": "market_position", "values": positions}
+        )
+        result = translate_intraday(intraday_input)
+
+        lines = result.timeseries_csv.strip().splitlines()
+        header = lines[0].split(",")
+        ch_idx = header.index("committed_charge")
+        dis_idx = header.index("committed_discharge")
+
+        # Row 0 is the prepended dummy — both should be 0
+        dummy = lines[1].split(",")
+        assert float(dummy[ch_idx]) == 0.0
+        assert float(dummy[dis_idx]) == 0.0
+
+        # Rows 1..n are the real intervals
+        for row_line, pos in zip(lines[2 : n + 2], positions):
+            parts = row_line.split(",")
+            committed_charge = float(parts[ch_idx])
+            committed_discharge = float(parts[dis_idx])
+            expected_charge = max(0.0, -pos)
+            expected_discharge = max(0.0, pos)
+            assert committed_charge == pytest.approx(expected_charge), (
+                f"pos={pos}: expected committed_charge={expected_charge}, "
+                f"got {committed_charge}"
+            )
+            assert committed_discharge == pytest.approx(expected_discharge), (
+                f"pos={pos}: expected committed_discharge={expected_discharge}, "
+                f"got {committed_discharge}"
+            )
+
+    def test_committed_position_decomposition_info_present(
+        self, intraday_input: dict[str, Any]
+    ) -> None:
+        """An _info entry is emitted when market_position is non-zero."""
+        result = translate_intraday(intraday_input)
+        # The fixture has market_position = [5.0] * n (non-zero)
+        decomp_msgs = [
+            i for i in result.info if "committed_charge" in i and "applied:" in i
+        ]
+        assert len(decomp_msgs) == 1
+
+    def test_zero_market_position_no_decomposition_info(self) -> None:
+        """No _info entry emitted when market_position is all zeros."""
+        from tests.conftest import _make_qh_timestamps
+
+        n = 4
+        starts, ends = _make_qh_timestamps(n)
+        model_input = {
+            "interval_start": starts,
+            "interval_end": ends,
+            "timeseries": [
+                {"name": "market_position", "values": [0.0] * n},
+                {"name": "state_of_charge", "values": [10.0]},
+                {"name": "orderbook[1]_price_in", "values": [50.0] * n},
+                {"name": "orderbook[1]_price_out", "values": [40.0] * n},
+                {"name": "orderbook[1]_max_power_in", "values": [10.0] * n},
+                {"name": "orderbook[1]_max_power_out", "values": [10.0] * n},
+            ],
+            "parameters": [{"name": "battery_capacity", "value": 20.0}],
+            "markets": [{"name": "orderbook", "n_orderbook_segments": 1}],
+        }
+        result = translate_intraday(model_input)
+        decomp_msgs = [i for i in result.info if "committed_charge" in i]
+        assert len(decomp_msgs) == 0
 
     def test_segment_detection_from_market_config(
         self, intraday_input: dict[str, Any]
@@ -389,7 +475,7 @@ class TestGridFeeSolverIntegration:
         )
 
         result = run_solver("scheduling", scheduling_input)
-        members = result["members"]["default"]
+        members = result["result"]["members"]["default"]
 
         charge_values = members["day_ahead_power_in"]["values"]
         discharge_values = members["day_ahead_power_out"]["values"]
@@ -419,7 +505,7 @@ class TestGridFeeSolverIntegration:
         )
 
         result = run_solver("scheduling", scheduling_input)
-        members = result["members"]["default"]
+        members = result["result"]["members"]["default"]
 
         charge_values = members["day_ahead_power_in"]["values"]
         discharge_values = members["day_ahead_power_out"]["values"]
@@ -452,7 +538,7 @@ class TestGridFeeSolverIntegration:
             ]
         )
         no_fee_result = run_solver("scheduling", no_fee_input)
-        no_fee_members = no_fee_result["members"]["default"]
+        no_fee_members = no_fee_result["result"]["members"]["default"]
         no_fee_volume = sum(no_fee_members["day_ahead_power_in"]["values"]) + sum(
             no_fee_members["day_ahead_power_out"]["values"]
         )
@@ -466,7 +552,7 @@ class TestGridFeeSolverIntegration:
             ]
         )
         fee_result = run_solver("scheduling", fee_input)
-        fee_members = fee_result["members"]["default"]
+        fee_members = fee_result["result"]["members"]["default"]
         fee_volume = sum(fee_members["day_ahead_power_in"]["values"]) + sum(
             fee_members["day_ahead_power_out"]["values"]
         )

@@ -20,7 +20,7 @@ The continuous intraday trading problem extends the basic BESS optimization with
 
 .. math::
 
-   \max \sum_{t} \left( \sum_{i=1}^{N} P_{discharge,i}^{new}(t) \cdot \pi_{bid,i}(t) - \sum_{i=1}^{N} P_{charge,i}^{new}(t) \cdot \pi_{ask,i}(t) - \lambda_{tx} \cdot (P_{charge}^{new}(t) + P_{discharge}^{new}(t)) - \lambda_{cyc} \cdot (P_{charge}^{new}(t) + P_{discharge}^{new}(t)) \right)
+   \max \sum_{t} \left( \sum_{i=1}^{N} P_{discharge,i}^{new}(t) \cdot \pi_{bid,i}(t) - \sum_{i=1}^{N} P_{charge,i}^{new}(t) \cdot \pi_{ask,i}(t) - \lambda_{tx} \cdot (P_{charge}^{new}(t) + P_{discharge}^{new}(t)) - \lambda_{cyc} \cdot (P_{charge}^{new}(t) + P_{discharge}^{new}(t)) \right) + \nu \cdot SoC(T)
 
 Where:
    * :math:`P_{discharge,i}^{new}(t)` = New power sold at bid level :math:`i` (intraday trades only)
@@ -30,6 +30,10 @@ Where:
    * :math:`N` = Number of orderbook levels (default: 10)
    * :math:`\lambda_{tx}` = Transaction cost per MWh traded
    * :math:`\lambda_{cyc}` = Cycling penalty factor (requires tuning based on market conditions)
+   * :math:`\nu` = Terminal SoC value (EUR/MWh); rewards energy stored at the end of the horizon
+   * :math:`SoC(T)` = State of charge at the final time step :math:`T`
+
+The terminal SoC term :math:`\nu \cdot SoC(T)` is especially important for rolling-horizon intraday optimisation: without it the solver greedily drains the battery to zero by the end of each optimisation window, leaving nothing for the next window.  Set :math:`\nu = 0` (the default) to disable it.
 
 **Power Allocation Constraints:**
 
@@ -141,6 +145,14 @@ The objective function maximizes trading profit by:
    * Calculating costs from buying from each ask level
    * Subtracting transaction costs on total traded volume
    * Subtracting cycling penalties to account for battery degradation
+
+**Terminal SoC Valuation:**
+
+.. literalinclude:: ../continuous_intraday/src/bess_intraday.py
+   :language: python
+   :pyobject: BESSIntraday.objective
+
+Setting ``stored_energy_value`` to a non-zero EUR/MWh figure prevents the solver from draining the battery to zero at the end of each rolling window.  The default value is ``0.0`` (disabled).
 
 **Path Constraints:**
 

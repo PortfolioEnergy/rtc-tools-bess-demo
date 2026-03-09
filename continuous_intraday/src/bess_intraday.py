@@ -30,6 +30,9 @@ class BESSIntraday(
         # Trading parameters
         self.transaction_cost = 0.05  # $/MWh transaction cost
         self.cycling_penalty_factor = 0.1  # $/MWh cycling penalty
+        self.stored_energy_value = (
+            0.0  # EUR/MWh value assigned to SoC remaining at horizon end
+        )
 
     def solver_options(self):
         """Configure solver options for mixed-integer optimization."""
@@ -94,13 +97,53 @@ class BESSIntraday(
         )
         return -profit
 
+    def objective(self, ensemble_member):
+        """Add terminal SoC valuation to the path objective total.
+
+        When ``stored_energy_value`` is non-zero (EUR/MWh), the solver is
+        rewarded for energy remaining in the battery at the end of the
+        optimisation horizon.  This prevents greedy end-of-horizon draining
+        when future trading opportunities exist beyond the current window.
+
+        RTC-Tools plain-sums ``path_objective`` over collocation points
+        without multiplying by dt, so rates in EUR/h are effectively
+        inflated by ``1/dt_hours``.  The terminal value must be scaled
+        by the same factor to remain comparable in magnitude.
+        """
+        obj = super().objective(ensemble_member)
+        if self.stored_energy_value != 0.0:
+            times = self.times()
+            dt_hours = (times[1] - times[0]) / 3600.0
+            soc_final = self.state_at("soc", times[-1], ensemble_member)
+            obj -= (self.stored_energy_value / dt_hours) * soc_final
+        return obj
+
     def path_constraints(self, ensemble_member):
         """Define path constraints (inequality constraints over time)."""
         constraints = super().path_constraints(ensemble_member)
 
         parameters = self.parameters(ensemble_member)
 
-        # Ensure only one mode can be active at a time (complementarity)
+        # Complementarity on incremental trades only.
+        #
+        # charge_power and discharge_power are now GROSS flows
+        # (committed + incremental) so they can both be non-zero when a
+        # committed position is partially offset by a new trade.  Applying
+        # complementarity to the gross variables would block those physically
+        # valid states.
+        #
+        # Instead, we gate the incremental decision variables: the optimizer
+        # cannot simultaneously place new charge orders (charge_power_asks)
+        # AND new discharge orders (discharge_power_bids) in the same
+        # interval.  This prevents gaming the cycling penalty via offsetting
+        # trades while allowing legitimate committed-vs-incremental offsets.
+        total_incr_charge = sum(
+            self.state(f"charge_power_asks[{i + 1}]") for i in range(self.n_entries)
+        )
+        total_incr_discharge = sum(
+            self.state(f"discharge_power_bids[{i + 1}]") for i in range(self.n_entries)
+        )
+
         constraints.append(
             (
                 self.state("is_charging") + self.state("is_discharging"),
@@ -110,15 +153,14 @@ class BESSIntraday(
         )
         constraints.append(
             (
-                self.state("charge_power")
-                - self.state("is_charging") * parameters["max_power"],
+                total_incr_charge - self.state("is_charging") * parameters["max_power"],
                 -np.inf,
                 0,
             )
         )
         constraints.append(
             (
-                self.state("discharge_power")
+                total_incr_discharge
                 - self.state("is_discharging") * parameters["max_power"],
                 -np.inf,
                 0,

@@ -1,16 +1,22 @@
 """Translate RTC-Tools CSV output into PE API response format.
 
 Adds ``_info`` entries for any PE API output variables that are not
-produced by the local solver.
+produced by the local solver.  When a solved ``OptimizationProblem``
+instance is provided via the ``prob`` keyword argument, diagnostic
+explainer charts are appended to ``_info`` as ``"image:<name>: <data URI>"``
+entries so that the response shape (``members`` + ``_info``) stays unchanged.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    from rtctools.optimization.optimization_problem import OptimizationProblem
 
 
 def _read_output_csv(output_dir: Path) -> pd.DataFrame:
@@ -44,10 +50,17 @@ def translate_scheduling_result(
     output_dir: Path,
     model_input: dict[str, Any],
     info: list[str],
+    *,
+    prob: "OptimizationProblem | None" = None,
 ) -> dict[str, Any]:
     """Build PE API response from scheduling solver output.
 
     Returns the ``result`` dict (goes inside ``{"result": ...}``).
+
+    When *prob* is provided the solved ``OptimizationProblem`` instance is
+    used to generate diagnostic explainer charts.  Each chart is appended to
+    ``_info`` as ``"image:<name>: <data URI>"`` so the response shape
+    (``members`` + ``_info``) remains unchanged.
     """
     df = _read_output_csv(output_dir)
 
@@ -86,6 +99,19 @@ def translate_scheduling_result(
                     f"— multi-band pricing not supported"
                 )
 
+    if prob is not None:
+        from service.translation.diagnostics import build_scheduling_diagnostics
+
+        # Retrieve the cycling penalty used during this solve from the class
+        # attribute stamped onto the dynamically-created solver subclass.
+        cycling_penalty = float(getattr(prob, "cycling_penalty_factor", 0.0))
+        images, diag_info = build_scheduling_diagnostics(
+            output_dir, model_input, cycling_penalty, prob
+        )
+        info.extend(diag_info)
+        for name, data_uri in images.items():
+            info.append(f"image:{name}: {data_uri}")
+
     return {"members": {"default": members}, "_info": info}
 
 
@@ -97,10 +123,17 @@ def translate_intraday_result(
     model_input: dict[str, Any],
     n_segments: int,
     info: list[str],
+    *,
+    prob: "OptimizationProblem | None" = None,
 ) -> dict[str, Any]:
     """Build PE API response from intraday solver output.
 
     Returns the ``result`` dict (goes inside ``{"result": ...}``).
+
+    When *prob* is provided the solved ``OptimizationProblem`` instance is
+    used to generate diagnostic explainer charts.  Each chart is appended to
+    ``_info`` as ``"image:<name>: <data URI>"`` so the response shape
+    (``members`` + ``_info``) remains unchanged.
     """
     df = _read_output_csv(output_dir)
 
@@ -133,12 +166,38 @@ def translate_intraday_result(
         else:
             members[f"orderbook[{seg}]_power_out"] = {"values": [0.0] * n}
 
-    # Aggregate battery power
+    # Aggregate battery power.
+    # charge_power and discharge_power are GROSS flows: committed position plus
+    # incremental trades.  Consumers who need only the incremental trades can
+    # sum the per-segment orderbook[N]_power_in / _power_out fields.
     members["battery_power_in"] = {"values": _safe_list(df["charge_power"])}
     members["battery_power_out"] = {"values": _safe_list(df["discharge_power"])}
     members["state_of_charge"] = {
         "values": _safe_list(df["soc"]),
         "times": soc_times,
     }
+
+    info.append(
+        "applied: 'battery_power_in' and 'battery_power_out' reflect gross "
+        "physical flows (committed position + incremental trades); use "
+        "orderbook[N]_power_in/_out fields for incremental trades only"
+    )
+
+    if prob is not None:
+        from service.translation.diagnostics import build_intraday_diagnostics
+
+        cycling_penalty = float(getattr(prob, "cycling_penalty_factor", 0.0))
+        transaction_cost = float(getattr(prob, "transaction_cost", 0.0))
+        images, diag_info = build_intraday_diagnostics(
+            output_dir,
+            model_input,
+            n_segments,
+            cycling_penalty,
+            transaction_cost,
+            prob,
+        )
+        info.extend(diag_info)
+        for name, data_uri in images.items():
+            info.append(f"image:{name}: {data_uri}")
 
     return {"members": {"default": members}, "_info": info}
