@@ -227,3 +227,27 @@ Key outputs from the optimization are visualized below:
    :align: center
 
 *Figure: BESS optimisation results showing (top to bottom): State of Charge profile, Charge/Discharge power decisions, Electricity price signal, and Cumulative revenue over the 24-hour optimisation horizon.*
+
+Optimiser Reasoning Output
+--------------------------
+
+When the REST service is called with ``include_diagnostics: true``, the
+response includes a top-level ``reasoning_markdown`` field — a deterministic
+markdown document that explains *why* the optimiser made each decision.
+
+To keep the payload small and queryable, anything essentially tabular is
+emitted as a **markdown table** rather than a rendered chart:
+
+* **Results**, **Energy Balance** and **Solver Statistics** tables — the
+  scalar KPIs a backtest framework stores per run.
+* **Per-Cycle Merit Order** table — one row per detected charge/discharge
+  cycle, ranked by net margin, making the diminishing return of successive
+  cycles explicit.
+* **Constraint Binding** table — the share of intervals each physical limit
+  is binding (replaces a heatmap).
+* **Full-Day Schedule** table — per-interval price, action, power and SoC.
+
+Three genuinely visual charts are embedded inline as ``data:`` URIs:
+``revenue_decomposition``, ``soc_headroom`` and ``decision_rationale``.  The
+same charts are also appended to ``result._info`` as ``image:<name>:`` entries
+for backward compatibility.

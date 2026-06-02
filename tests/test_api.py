@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
-import pytest
 from fastapi.testclient import TestClient
 
 
@@ -158,6 +157,34 @@ class TestSubmitSync:
             # no top-level images key and no images key inside result
             assert "images" not in body
             assert "images" not in body["result"]
+
+    def test_reasoning_markdown_passed_through(
+        self, client: TestClient, scheduling_input: dict[str, Any]
+    ) -> None:
+        """A top-level ``reasoning_markdown`` key from run_solver is returned verbatim.
+
+        poc-backtesting reads ``reasoning_markdown`` from the top level of the
+        optimiser response (next to ``result``), so the route must not strip it.
+        """
+        mock_body = {
+            "result": {"members": {"default": {}}, "_info": ["solver: mock"]},
+            "reasoning_markdown": "# Day-Ahead Scheduling — Optimiser Reasoning\n",
+        }
+        with patch("service.routes.run_solver", return_value=mock_body):
+            resp = client.post(
+                "/v1/models/bess_day_ahead/submit_sync",
+                json={
+                    "model_input_data": scheduling_input,
+                    "include_diagnostics": True,
+                },
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert "reasoning_markdown" in body
+            assert body["reasoning_markdown"].startswith("# Day-Ahead Scheduling")
+            # result shape unchanged
+            assert "members" in body["result"]
+            assert "_info" in body["result"]
 
     def test_solver_error_returns_500(
         self, client: TestClient, scheduling_input: dict[str, Any]

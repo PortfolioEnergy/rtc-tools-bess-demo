@@ -246,3 +246,39 @@ The rolling intrinsic policy enables the battery to:
    * Optimize across multiple price levels
    * Account for liquidity constraints at each level
    * Maximize trading profit while respecting volume limits
+
+Optimiser Reasoning Output
+--------------------------
+
+When the REST service is called with ``include_diagnostics: true``, the
+response includes a top-level ``reasoning_markdown`` field — a deterministic
+markdown document explaining *why* the optimiser cycled the battery the way
+it did.
+
+Anything essentially tabular is emitted as a **markdown table** rather than a
+rendered chart, which keeps the payload small and machine-queryable:
+
+* **Results**, **Energy Balance** and **Solver Statistics** tables.
+* **Committed Position** section — the inherited committed schedule enters the
+  model as a fixed, *priceless* input to the SoC dynamics; for an intraday run
+  it is usually the dominant driver of battery activity. This section reports
+  the committed obligation, its share of total throughput, and the charging
+  the SoC ≥ 0 constraint forces for feasibility.
+* **Per-Cycle Merit Order** table — a post-hoc grouping of the optimiser's
+  *incremental* trades into charge/discharge cycles, ranked by net margin.
+  (The optimiser itself does not reason in discrete cycles; its objective
+  applies a flat per-MWh penalty.)
+* **Constraint Binding** table — share of intervals each limit is binding.
+* **Orderbook Depth Utilisation** table — average fill per orderbook level.
+
+The reconstruction mirrors the solver objective exactly: cycling penalty,
+transaction cost and grid fees apply to **incremental trades only**, never to
+the committed position.
+
+Four genuinely visual charts are embedded inline as ``data:`` URIs:
+``revenue_decomposition``, ``soc_headroom``, ``spread_duration`` (sorted
+price-duration curves against the break-even spread) and
+``committed_position`` (committed obligation vs incremental trades, and the
+SoC the committed schedule alone would produce).  The same charts are also
+appended to ``result._info`` as ``image:<name>:`` entries for backward
+compatibility.

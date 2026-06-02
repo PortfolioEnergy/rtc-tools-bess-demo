@@ -28,16 +28,17 @@ def submit_sync(model_name: str, body: SubmitRequest) -> dict[str, Any]:
 
     Resolves ``model_name`` to a local solver type, runs the solver, and
     returns a body shaped as ``{"result": {...}}`` — or, when diagnostics are
-    enabled, ``{"result": {...}, "images": {...}}``.
+    enabled, ``{"result": {...}, "reasoning_markdown": "..."}``.
 
-    ``result`` always contains ``members`` and ``_info`` and never contains
-    ``images``, preserving the PE API contract on the ``result`` shape.
+    ``result`` always contains ``members`` and ``_info``, preserving the PE
+    API contract on the ``result`` shape.
 
-    Set ``include_diagnostics: true`` in the request body to include
-    base64-encoded explainer charts under the top-level ``images`` key.
-    Charts visualise optimizer internals (constraint tightness, shadow prices,
-    revenue decomposition, decision rationale) and add roughly 100–250 ms of
-    post-processing overhead.
+    Set ``include_diagnostics: true`` in the request body to generate
+    explainer output: base64-encoded charts are embedded in ``result._info``
+    as ``"image:<name>: <data URI>"`` entries, and a deterministic
+    ``reasoning_markdown`` document (KPI/cycle/constraint tables plus the
+    embedded charts) is returned as a top-level key. This adds roughly
+    100–300 ms of post-processing overhead.
     """
     solver_type = resolve_solver_type(model_name)
     if solver_type is None:

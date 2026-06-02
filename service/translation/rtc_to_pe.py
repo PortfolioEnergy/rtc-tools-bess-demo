@@ -52,10 +52,12 @@ def translate_scheduling_result(
     info: list[str],
     *,
     prob: "OptimizationProblem | None" = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str]:
     """Build PE API response from scheduling solver output.
 
-    Returns the ``result`` dict (goes inside ``{"result": ...}``).
+    Returns ``(result, reasoning_markdown)``. ``result`` goes inside
+    ``{"result": ...}``; ``reasoning_markdown`` is a top-level response key
+    (empty string when diagnostics are not requested).
 
     When *prob* is provided the solved ``OptimizationProblem`` instance is
     used to generate diagnostic explainer charts.  Each chart is appended to
@@ -99,20 +101,21 @@ def translate_scheduling_result(
                     f"— multi-band pricing not supported"
                 )
 
+    reasoning_markdown = ""
     if prob is not None:
         from service.translation.diagnostics import build_scheduling_diagnostics
 
         # Retrieve the cycling penalty used during this solve from the class
         # attribute stamped onto the dynamically-created solver subclass.
         cycling_penalty = float(getattr(prob, "cycling_penalty_factor", 0.0))
-        images, diag_info = build_scheduling_diagnostics(
+        images, diag_info, reasoning_markdown = build_scheduling_diagnostics(
             output_dir, model_input, cycling_penalty, prob
         )
         info.extend(diag_info)
         for name, data_uri in images.items():
             info.append(f"image:{name}: {data_uri}")
 
-    return {"members": {"default": members}, "_info": info}
+    return {"members": {"default": members}, "_info": info}, reasoning_markdown
 
 
 # ── intraday ─────────────────────────────────────────────────────────
@@ -125,10 +128,12 @@ def translate_intraday_result(
     info: list[str],
     *,
     prob: "OptimizationProblem | None" = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str]:
     """Build PE API response from intraday solver output.
 
-    Returns the ``result`` dict (goes inside ``{"result": ...}``).
+    Returns ``(result, reasoning_markdown)``. ``result`` goes inside
+    ``{"result": ...}``; ``reasoning_markdown`` is a top-level response key
+    (empty string when diagnostics are not requested).
 
     When *prob* is provided the solved ``OptimizationProblem`` instance is
     used to generate diagnostic explainer charts.  Each chart is appended to
@@ -183,12 +188,13 @@ def translate_intraday_result(
         "orderbook[N]_power_in/_out fields for incremental trades only"
     )
 
+    reasoning_markdown = ""
     if prob is not None:
         from service.translation.diagnostics import build_intraday_diagnostics
 
         cycling_penalty = float(getattr(prob, "cycling_penalty_factor", 0.0))
         transaction_cost = float(getattr(prob, "transaction_cost", 0.0))
-        images, diag_info = build_intraday_diagnostics(
+        images, diag_info, reasoning_markdown = build_intraday_diagnostics(
             output_dir,
             model_input,
             n_segments,
@@ -200,4 +206,4 @@ def translate_intraday_result(
         for name, data_uri in images.items():
             info.append(f"image:{name}: {data_uri}")
 
-    return {"members": {"default": members}, "_info": info}
+    return {"members": {"default": members}, "_info": info}, reasoning_markdown

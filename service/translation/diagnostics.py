@@ -1,24 +1,29 @@
-"""Optimizer explainer diagrams for the BESS service.
+"""Optimizer explainer diagrams and reasoning data for the BESS service.
 
-Generates a set of diagnostic charts from RTC-Tools solver internals that
-explain *why* the optimizer made each decision.  Charts are returned as a
-``dict[str, str]`` mapping a chart name to a ``data:image/png;base64,…``
-URI suitable for embedding directly in JSON responses.
+Generates a *small, deliberately curated* set of diagnostic charts from
+RTC-Tools solver internals, plus the structured tables and metrics that feed
+the deterministic reasoning-markdown document (see ``reasoning.py``).
+
+Design choice — charts vs. tables
+---------------------------------
+A heatmap that only rescales primal output, or a bar chart of a handful of
+discrete cycles, transfers far more bytes than the few numbers it conveys.
+Such views are emitted as **markdown tables** instead.  Only genuinely visual
+charts (per-interval shapes, duration curves) are rendered as PNGs:
+
+- ``revenue_decomposition`` — per-interval value breakdown + cumulative P&L
+- ``soc_headroom`` — SoC trajectory and capacity utilisation
+- ``decision_rationale`` — scheduling: why-trade-here threshold overlay
+- ``spread_duration`` — intraday: how much profitable spread the market offered
+
+Everything else (per-cycle merit order, constraint binding, orderbook depth,
+solver statistics) is returned as table/metric data for the markdown builder.
 
 All functions accept the ``prob`` object returned by
-``rtctools.util.run_optimization_problem`` and the relevant input/output
-DataFrames that the service already reads from CSV.  No re-solving occurs —
-every computation is a cheap post-processing step on data that is already
-available.
+``rtctools.util.run_optimization_problem`` and the input/output DataFrames the
+service already reads from CSV.  No re-solving occurs.
 
-Performance is managed by:
-- Using the ``Agg`` backend (no GUI, no display required).
-- Rendering at 100 DPI with compact figure sizes.
-- Calling ``plt.close(fig)`` immediately after encoding to release memory.
-- Wrapping each chart in a try/except so a single broken chart never
-  crashes the full diagnostic pass.
-
-Two public entry points are provided:
+Public entry points return ``(images, info, reasoning_markdown)``:
 - ``build_scheduling_diagnostics`` — day-ahead scheduling model
 - ``build_intraday_diagnostics`` — continuous intraday trading model
 """
@@ -29,6 +34,7 @@ import base64
 import io
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import matplotlib
@@ -37,12 +43,9 @@ import numpy as np
 import pandas as pd
 
 # Force non-interactive backend before any figure is created.
-# This must happen before the first import of pyplot's display machinery.
 matplotlib.use("Agg")
 
 if TYPE_CHECKING:
-    # Avoid a hard import of rtctools at module level so that the module can
-    # be imported (and unit-tested) without a full RTC-Tools installation.
     from rtctools.optimization.optimization_problem import OptimizationProblem
 
 _log = logging.getLogger(__name__)
@@ -63,7 +66,7 @@ _C = {
 
 _FIG_W = 9  # inches — wide enough to show 24–96 timesteps clearly
 _FIG_H = 3.2  # inches per sub-axes
-_DPI = 100
+_DPI = 120
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -122,6 +125,100 @@ def _label_axes(ax: plt.Axes, ylabel: str, xlabel: str = "Time (hours)") -> None
     ax.yaxis.label.set_color(_C["text"])
 
 
+def _place_label(
+    ax: plt.Axes,
+    x: float,
+    y: float,
+    text: str,
+    *,
+    placed: list[tuple[float, float, float, float]],
+    fontsize: float = 7,
+    color: str = "#2c3e50",
+    ec: str | None = None,
+    fontweight: str = "normal",
+    ha: str = "center",
+    va: str = "center",
+    zorder: int = 6,
+    x_range: tuple[float, float] = (0.0, 24.0),
+    y_range: tuple[float, float] | None = None,
+) -> None:
+    """Place a text label, nudging it to avoid overlapping already-placed labels.
+
+    ``placed`` is a mutable list of (x0, y0, x1, y1) data-coordinate bounding
+    boxes, updated in-place so later calls step away from earlier labels.
+    Ported from the poc-backtesting local DA-spread adapter.
+    """
+    renderer = ax.get_figure().canvas.get_renderer()
+    tmp = ax.text(x, y, text, fontsize=fontsize, ha=ha, va=va, visible=False)
+    try:
+        bbox_disp = tmp.get_window_extent(renderer=renderer)
+        inv = ax.transData.inverted()
+        lo = inv.transform((bbox_disp.x0, bbox_disp.y0))
+        hi = inv.transform((bbox_disp.x1, bbox_disp.y1))
+        w = abs(hi[0] - lo[0])
+        h = abs(hi[1] - lo[1])
+    except Exception:
+        w, h = 1.5, 5.0
+    finally:
+        tmp.remove()
+
+    step_x, step_y = max(w * 0.6, 0.5), max(h * 1.1, 1.0)
+    candidates: list[tuple[float, float]] = [(0.0, 0.0)]
+    for ring in range(1, 10):
+        for dx in range(-ring, ring + 1):
+            for dy in range(-ring, ring + 1):
+                if abs(dx) == ring or abs(dy) == ring:
+                    candidates.append((dx * step_x, dy * step_y))
+
+    xl, xr = x_range
+    for dx, dy in candidates:
+        cx, cy = x + dx, y + dy
+        cx = max(xl + w / 2, min(xr - w / 2, cx))
+        if y_range:
+            yl_r, yr_r = y_range
+            cy = max(yl_r + h / 2, min(yr_r - h / 2, cy))
+        bx0, by0 = cx - w / 2, cy - h / 2
+        bx1, by1 = cx + w / 2, cy + h / 2
+        overlap = any(
+            bx0 < px1 and bx1 > px0 and by0 < py1 and by1 > py0
+            for px0, py0, px1, py1 in placed
+        )
+        if not overlap:
+            bbox_kw = (
+                dict(boxstyle="round,pad=0.3", fc="white", ec=ec or color, alpha=0.92)
+                if ec is not None
+                else None
+            )
+            ax.text(
+                cx,
+                cy,
+                text,
+                ha=ha,
+                va=va,
+                fontsize=fontsize,
+                fontweight=fontweight,
+                color=color,
+                zorder=zorder,
+                **({"bbox": bbox_kw} if bbox_kw else {}),
+            )
+            placed.append((bx0, by0, bx1, by1))
+            return
+
+    ax.text(
+        x, y, text, ha=ha, va=va, fontsize=fontsize, fontweight=fontweight,
+        color=color, zorder=zorder,
+    )
+    placed.append((x - w / 2, y - h / 2, x + w / 2, y + h / 2))
+
+
+def _param(prob: "OptimizationProblem", name: str, default: float) -> float:
+    """Read a numeric model parameter, falling back to *default* on any error."""
+    try:
+        return float(prob.parameters(0).get(name, default))
+    except Exception:
+        return default
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Chart 1 — Revenue decomposition waterfall
 # ══════════════════════════════════════════════════════════════════════════════
@@ -132,20 +229,14 @@ def _chart_revenue_decomposition_scheduling(
     df_in: pd.DataFrame,
     cycling_penalty: float,
 ) -> plt.Figure:
-    """Waterfall of gross revenue, costs, and net profit over the horizon.
-
-    Shows how each cost component erodes gross revenue so the operator can
-    see which term most constrains optimiser aggressiveness.
-    """
+    """Waterfall of gross revenue, costs, and net profit over the horizon."""
     t = _time_axis(df_out)
-    # Align input timeseries length to output (output may have been trimmed)
     n = len(df_out)
     price = df_in["price"].values[:n]
     charge = df_out["charge_power"].values
     discharge = df_out["discharge_power"].values
     net_power = df_out["net_power"].values
 
-    # dt in hours (uniform grid assumed)
     dt = (t[1] - t[0]) if len(t) > 1 else 1.0
 
     gross_rev_ts = net_power * price * dt
@@ -165,59 +256,37 @@ def _chart_revenue_decomposition_scheduling(
 
     fig, axes = _make_fig(2, "Revenue Decomposition — Scheduling")
 
-    # Top: per-interval stacked bars showing value breakdown
     ax = axes[0]
     positive_rev = np.maximum(gross_rev_ts, 0)
     negative_rev = np.minimum(gross_rev_ts, 0)
     ax.bar(
-        t,
-        positive_rev,
-        color=_C["discharge"],
-        label="Gross revenue (discharge)",
-        width=dt * 0.8,
+        t, positive_rev, color=_C["discharge"],
+        label="Gross revenue (discharge)", width=dt * 0.8,
     )
     ax.bar(
         t, negative_rev, color=_C["charge"], label="Gross cost (charge)", width=dt * 0.8
     )
     ax.bar(
-        t,
-        -grid_fee_in_ts - grid_fee_out_ts,
-        bottom=negative_rev,
-        color=_C["warn"],
-        label="Grid fees",
-        width=dt * 0.8,
-        alpha=0.8,
+        t, -grid_fee_in_ts - grid_fee_out_ts, bottom=negative_rev,
+        color=_C["warn"], label="Grid fees", width=dt * 0.8, alpha=0.8,
     )
     ax.bar(
-        t,
-        -cycling_ts,
-        bottom=negative_rev - grid_fee_in_ts - grid_fee_out_ts,
-        color=_C["idle"],
-        label="Cycling penalty",
-        width=dt * 0.8,
-        alpha=0.8,
+        t, -cycling_ts, bottom=negative_rev - grid_fee_in_ts - grid_fee_out_ts,
+        color=_C["idle"], label="Cycling penalty", width=dt * 0.8, alpha=0.8,
     )
     ax.axhline(0, color=_C["text"], linewidth=0.8)
     ax.legend(fontsize=7, loc="upper left")
     _label_axes(ax, "EUR per interval", xlabel="")
 
-    # Bottom: cumulative net profit
     ax2 = axes[1]
     cumulative_net = np.cumsum(net_ts)
     ax2.plot(
-        t,
-        cumulative_net,
-        color=_C["neutral"],
-        linewidth=1.8,
+        t, cumulative_net, color=_C["neutral"], linewidth=1.8,
         label="Cumulative net profit",
     )
     ax2.fill_between(
-        t,
-        0,
-        cumulative_net,
-        where=cumulative_net >= 0,
-        color=_C["discharge"],
-        alpha=0.15,
+        t, 0, cumulative_net, where=cumulative_net >= 0,
+        color=_C["discharge"], alpha=0.15,
     )
     ax2.fill_between(
         t, 0, cumulative_net, where=cumulative_net < 0, color=_C["charge"], alpha=0.15
@@ -226,7 +295,6 @@ def _chart_revenue_decomposition_scheduling(
     ax2.legend(fontsize=7)
     _label_axes(ax2, "Cumulative EUR")
 
-    # Annotate final total
     total = float(cumulative_net[-1]) if len(cumulative_net) else 0.0
     color = _C["discharge"] if total >= 0 else _C["charge"]
     ax2.annotate(
@@ -255,7 +323,6 @@ def _chart_revenue_decomposition_intraday(
     n = len(df_out)
     dt = (t[1] - t[0]) if len(t) > 1 else 1.0
 
-    # Aggregate revenue per segment and direction
     total_discharge_rev = np.zeros(n)
     total_charge_cost = np.zeros(n)
     for seg in range(1, n_segments + 1):
@@ -293,26 +360,16 @@ def _chart_revenue_decomposition_intraday(
 
     ax = axes[0]
     ax.bar(
-        t,
-        np.maximum(gross_rev_ts, 0),
-        color=_C["discharge"],
-        label="Trading revenue",
-        width=dt * 0.8,
+        t, np.maximum(gross_rev_ts, 0), color=_C["discharge"],
+        label="Trading revenue", width=dt * 0.8,
     )
     ax.bar(
-        t,
-        np.minimum(gross_rev_ts, 0),
-        color=_C["charge"],
-        label="Trading cost",
-        width=dt * 0.8,
+        t, np.minimum(gross_rev_ts, 0), color=_C["charge"],
+        label="Trading cost", width=dt * 0.8,
     )
     ax.bar(
-        t,
-        -cycling_ts - transaction_ts,
-        bottom=np.minimum(gross_rev_ts, 0),
-        color=_C["idle"],
-        label="Cycling + transaction costs",
-        width=dt * 0.8,
+        t, -cycling_ts - transaction_ts, bottom=np.minimum(gross_rev_ts, 0),
+        color=_C["idle"], label="Cycling + transaction costs", width=dt * 0.8,
         alpha=0.8,
     )
     ax.axhline(0, color=_C["text"], linewidth=0.8)
@@ -323,12 +380,8 @@ def _chart_revenue_decomposition_intraday(
     cumulative_net = np.cumsum(net_ts)
     ax2.plot(t, cumulative_net, color=_C["neutral"], linewidth=1.8)
     ax2.fill_between(
-        t,
-        0,
-        cumulative_net,
-        where=cumulative_net >= 0,
-        color=_C["discharge"],
-        alpha=0.15,
+        t, 0, cumulative_net, where=cumulative_net >= 0,
+        color=_C["discharge"], alpha=0.15,
     )
     ax2.fill_between(
         t, 0, cumulative_net, where=cumulative_net < 0, color=_C["charge"], alpha=0.15
@@ -341,111 +394,7 @@ def _chart_revenue_decomposition_intraday(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Chart 2 — Constraint tightness heatmap
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _chart_constraint_tightness(
-    df_out: pd.DataFrame,
-    prob: "OptimizationProblem",
-) -> plt.Figure:
-    """How close each constraint is to its bound at every timestep.
-
-    A value of 1.0 (red) means the constraint is at its limit; 0.0 (white)
-    means it is completely loose.  This reveals where the optimiser is
-    "pinned" against physical or operational limits.
-    """
-    t = _time_axis(df_out)
-    n = len(df_out)
-
-    try:
-        params = prob.parameters(0)
-        capacity = float(params.get("capacity", 100.0))
-        max_power = float(params.get("max_power", 50.0))
-    except Exception:
-        capacity = 100.0
-        max_power = 50.0
-
-    soc = df_out["soc"].values[:n]
-    charge = df_out["charge_power"].values[:n]
-    discharge = df_out["discharge_power"].values[:n]
-
-    # Tightness = how close to the binding limit, in [0, 1]
-    # SoC upper bound (capacity)
-    soc_upper = np.clip(soc / capacity, 0.0, 1.0)
-    # SoC lower bound (zero) — closeness to draining
-    soc_lower = np.clip(1.0 - soc / capacity, 0.0, 1.0)
-    # Charge power limit
-    charge_tight = np.clip(
-        charge / max_power if max_power > 0 else np.zeros(n), 0.0, 1.0
-    )
-    # Discharge power limit
-    discharge_tight = np.clip(
-        discharge / max_power if max_power > 0 else np.zeros(n), 0.0, 1.0
-    )
-    # Complementarity: is_charging + is_discharging <= 1
-    # Approximate as: how far from both simultaneously being active
-    # (1.0 when one mode fully used, 0.0 when idle)
-    mode_usage = np.clip(
-        (charge + discharge) / max_power if max_power > 0 else np.zeros(n), 0.0, 1.0
-    )
-
-    # Build matrix: rows = constraint types, cols = timesteps
-    matrix = np.vstack(
-        [
-            soc_upper,
-            soc_lower,
-            charge_tight,
-            discharge_tight,
-            mode_usage,
-        ]
-    )
-
-    row_labels = [
-        "SoC → full",
-        "SoC → empty",
-        "Charge at limit",
-        "Discharge at limit",
-        "Mode usage",
-    ]
-
-    fig, ax = plt.subplots(1, 1, figsize=(_FIG_W, 2.5), facecolor=_C["bg"])
-    fig.suptitle(
-        "Constraint Tightness (0 = loose, 1 = binding)",
-        color=_C["text"],
-        fontsize=11,
-        fontweight="bold",
-    )
-
-    im = ax.imshow(
-        matrix,
-        aspect="auto",
-        cmap="RdYlGn_r",
-        vmin=0.0,
-        vmax=1.0,
-        interpolation="nearest",
-        extent=[
-            t[0] if len(t) else 0,
-            t[-1] if len(t) else n,
-            -0.5,
-            len(row_labels) - 0.5,
-        ],
-    )
-    ax.set_yticks(range(len(row_labels)))
-    ax.set_yticklabels(row_labels, fontsize=8, color=_C["text"])
-    ax.set_xlabel("Time (hours)", color=_C["text"], fontsize=9)
-    ax.tick_params(colors=_C["text"])
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
-    cbar.ax.tick_params(colors=_C["text"])
-    cbar.set_label("Tightness", color=_C["text"], fontsize=8)
-
-    fig.tight_layout()
-    return fig
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Chart 3 — SoC headroom and utilisation
+# Chart 2 — SoC headroom and utilisation
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -453,24 +402,13 @@ def _chart_soc_headroom(
     df_out: pd.DataFrame,
     prob: "OptimizationProblem",
 ) -> plt.Figure:
-    """SoC trajectory with capacity bounds and utilisation fraction.
-
-    The shaded band between min and max SoC reveals how much headroom the
-    optimiser chose to keep and where SoC limits genuinely constrained
-    the strategy.
-    """
+    """SoC trajectory with capacity bounds and utilisation fraction."""
     t = _time_axis(df_out)
     n = len(df_out)
 
-    try:
-        params = prob.parameters(0)
-        capacity = float(params.get("capacity", 100.0))
-        soc_min = 0.0
-        soc_max = capacity
-    except Exception:
-        capacity = 100.0
-        soc_min = 0.0
-        soc_max = capacity
+    capacity = _param(prob, "capacity", 100.0)
+    soc_min = 0.0
+    soc_max = capacity
 
     soc = df_out["soc"].values[:n]
     utilisation = (
@@ -490,17 +428,11 @@ def _chart_soc_headroom(
     )
     ax.plot(t, soc, color=_C["neutral"], linewidth=1.8, label="SoC")
     ax.axhline(
-        soc_max,
-        color=_C["warn"],
-        linewidth=1.0,
-        linestyle="--",
+        soc_max, color=_C["warn"], linewidth=1.0, linestyle="--",
         label=f"Max ({soc_max:.0f} MWh)",
     )
     ax.axhline(
-        soc_min,
-        color=_C["charge"],
-        linewidth=1.0,
-        linestyle="--",
+        soc_min, color=_C["charge"], linewidth=1.0, linestyle="--",
         label=f"Min ({soc_min:.0f} MWh)",
     )
     ax.legend(fontsize=7, loc="upper right")
@@ -524,116 +456,7 @@ def _chart_soc_headroom(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Chart 4 — Shadow prices / Lagrange multipliers on SoC bounds
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _chart_shadow_prices(
-    df_out: pd.DataFrame,
-    prob: "OptimizationProblem",
-) -> plt.Figure | None:
-    """Lagrange multipliers on the variable bounds, indicating opportunity cost.
-
-    A non-zero shadow price on the SoC upper bound at time t means the
-    optimiser would earn more if capacity were larger at that moment.  A
-    non-zero value on the lower bound means it would earn more if the battery
-    could discharge further.
-
-    For MILP problems HiGHS may not provide duals.  When duals are
-    unavailable this function returns ``None`` and the caller omits the chart.
-    """
-    try:
-        lam_g, lam_x = prob.lagrange_multipliers
-        if lam_x is None:
-            return None
-        lam_x_arr = np.array(lam_x).ravel()
-        if len(lam_x_arr) == 0:
-            return None
-    except Exception:
-        return None
-
-    t = _time_axis(df_out)
-    n = len(df_out)
-
-    # lam_x is a vector over all decision variables in the collocation NLP.
-    # We can't easily demultiplex which entries correspond to SoC without
-    # detailed knowledge of the collocation structure, so we show the full
-    # lam_x magnitude distribution over time as a heatmap — still informative
-    # as it shows when the solver is near active bounds.
-    try:
-        solver_stats = prob.solver_stats
-        obj_val = _safe_float(prob.objective_value)
-        return_status = solver_stats.get("return_status", "unknown")
-        wall_time = _safe_float(
-            solver_stats.get("t_wall_total") or solver_stats.get("t_wall_solver")
-        )
-        n_vars = len(lam_x_arr)
-    except Exception:
-        return None
-
-    # Reshape lam_x into a time×variable grid if possible.
-    # For a uniform collocation problem the NLP variable vector is arranged
-    # as [x_0, x_1, …, x_T] where each x_t contains all variables at t.
-    # If it divides evenly we use that; otherwise show the full vector.
-    vars_per_step = max(1, n_vars // max(n, 1))
-    n_steps = n_vars // vars_per_step
-    reshaped = lam_x_arr[: n_steps * vars_per_step].reshape(n_steps, vars_per_step)
-    magnitude = np.abs(reshaped)
-
-    fig, axes = _make_fig(2, "Solver Internals — Shadow Prices & Statistics")
-
-    # Top: lam_x magnitude heatmap
-    ax = axes[0]
-    im = ax.imshow(
-        magnitude.T,
-        aspect="auto",
-        cmap="plasma",
-        interpolation="nearest",
-    )
-    ax.set_xlabel("Collocation step", color=_C["text"], fontsize=9)
-    ax.set_ylabel("Variable index", color=_C["text"], fontsize=9)
-    ax.tick_params(colors=_C["text"])
-    cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
-    cbar.ax.tick_params(colors=_C["text"])
-    cbar.set_label("|λ|", color=_C["text"], fontsize=8)
-    ax.set_title(
-        "Bound shadow prices |λₓ| — non-zero = active bound",
-        color=_C["text"],
-        fontsize=9,
-    )
-
-    # Bottom: solver statistics as a text panel
-    ax2 = axes[1]
-    ax2.axis("off")
-    stats_lines = [
-        f"Solver status:  {return_status}",
-        f"Objective value:  {obj_val:.4f}"
-        if obj_val is not None
-        else "Objective value: n/a",
-        f"Wall-clock time:  {wall_time:.3f}s"
-        if wall_time is not None
-        else "Wall-clock time: n/a",
-        f"NLP variables:  {n_vars}",
-        f"Collocation steps:  {n_steps}",
-    ]
-    ax2.text(
-        0.05,
-        0.95,
-        "\n".join(stats_lines),
-        transform=ax2.transAxes,
-        verticalalignment="top",
-        fontsize=9,
-        color=_C["text"],
-        family="monospace",
-        bbox=dict(facecolor=_C["bg"], edgecolor=_C["grid"], boxstyle="round,pad=0.4"),
-    )
-
-    fig.tight_layout()
-    return fig
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Chart 5 — Decision rationale overlay (scheduling only)
+# Chart 3 — Decision rationale overlay (scheduling only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -643,16 +466,7 @@ def _chart_decision_rationale_scheduling(
     cycling_penalty: float,
     prob: "OptimizationProblem",
 ) -> plt.Figure:
-    """Annotated price chart explaining charge / discharge / idle decisions.
-
-    Overlays the price curve with:
-    - The effective charge price threshold (ask_price + cycling_penalty + grid_fee_in)
-    - The effective discharge price threshold (bid_price − cycling_penalty − grid_fee_out)
-    - The break-even spread: the minimum price gap required to trade profitably
-    - Colour-coded background bands showing the decision at each interval
-
-    This directly answers: "Why didn't the optimiser trade at hour X?"
-    """
+    """Annotated price chart explaining charge / discharge / idle decisions."""
     t = _time_axis(df_out)
     n = len(df_out)
     dt = (t[1] - t[0]) if len(t) > 1 else 1.0
@@ -661,12 +475,7 @@ def _chart_decision_rationale_scheduling(
     charge = df_out["charge_power"].values[:n]
     discharge = df_out["discharge_power"].values[:n]
 
-    try:
-        params = prob.parameters(0)
-        efficiency = float(params.get("efficiency", 0.81))
-    except Exception:
-        efficiency = 0.81
-
+    efficiency = _param(prob, "efficiency", 0.81)
     sqrt_eff = efficiency**0.5 if efficiency > 0 else 1.0
 
     fee_in = (
@@ -680,15 +489,15 @@ def _chart_decision_rationale_scheduling(
         else np.zeros(n)
     )
 
-    # Effective charge cost: you pay price/sqrt_eff per MWh stored + cycling + grid fee
-    # (round-trip: charge at eff_in, discharge at eff_out; single sqrt per leg)
+    # Round-trip efficiency split per leg: charging stores only sqrt_eff of
+    # each MWh bought, so the effective cost per *stored* MWh is price/sqrt_eff;
+    # discharging delivers only sqrt_eff of each MWh drawn, so the effective
+    # revenue per *stored* MWh is price*sqrt_eff.
     effective_charge_price = price / sqrt_eff + cycling_penalty + fee_in
     effective_discharge_price = price * sqrt_eff - cycling_penalty - fee_out
 
-    # Break-even spread: how large the sell/buy price difference must be
     breakeven_spread = 2.0 * cycling_penalty / sqrt_eff + (fee_in + fee_out) / sqrt_eff
 
-    # Classify each interval
     is_charging = charge > 0.01
     is_discharging = discharge > 0.01
 
@@ -696,7 +505,6 @@ def _chart_decision_rationale_scheduling(
 
     ax = axes[0]
 
-    # Decision background bands
     for i in range(n):
         x0 = t[i]
         x1 = t[i] + dt
@@ -711,28 +519,16 @@ def _chart_decision_rationale_scheduling(
         t, price, where="post", color=_C["text"], linewidth=2.0, label="Market price"
     )
     ax.step(
-        t,
-        effective_charge_price,
-        where="post",
-        color=_C["charge"],
-        linewidth=1.2,
-        linestyle="--",
-        label="Effective charge threshold",
+        t, effective_charge_price, where="post", color=_C["charge"],
+        linewidth=1.2, linestyle="--", label="Effective charge threshold",
     )
     ax.step(
-        t,
-        effective_discharge_price,
-        where="post",
-        color=_C["discharge"],
-        linewidth=1.2,
-        linestyle="--",
-        label="Effective discharge threshold",
+        t, effective_discharge_price, where="post", color=_C["discharge"],
+        linewidth=1.2, linestyle="--", label="Effective discharge threshold",
     )
 
-    ax.legend(fontsize=7, loc="upper right")
     _label_axes(ax, "Price (EUR/MWh)", xlabel="")
 
-    # Custom legend for decision background
     from matplotlib.patches import Patch
 
     legend_patches = [
@@ -746,32 +542,19 @@ def _chart_decision_rationale_scheduling(
         loc="upper left",
     )
 
-    # Bottom: break-even spread and realised spread
     ax2 = axes[1]
     realised_spread = effective_discharge_price - effective_charge_price
     ax2.fill_between(
-        t,
-        0,
-        breakeven_spread,
-        color=_C["warn"],
-        alpha=0.2,
+        t, 0, breakeven_spread, color=_C["warn"], alpha=0.2,
         label=f"Break-even spread ({breakeven_spread.mean():.2f} EUR/MWh avg)",
     )
     ax2.step(
-        t,
-        np.maximum(realised_spread, 0),
-        where="post",
-        color=_C["discharge"],
-        linewidth=1.5,
-        label="Profitable spread (effective)",
+        t, np.maximum(realised_spread, 0), where="post", color=_C["discharge"],
+        linewidth=1.5, label="Profitable spread (effective)",
     )
     ax2.step(
-        t,
-        np.minimum(realised_spread, 0),
-        where="post",
-        color=_C["charge"],
-        linewidth=1.0,
-        label="Unprofitable region",
+        t, np.minimum(realised_spread, 0), where="post", color=_C["charge"],
+        linewidth=1.0, label="Unprofitable region",
     )
     ax2.axhline(0, color=_C["text"], linewidth=0.8)
     ax2.legend(fontsize=7, loc="upper right")
@@ -782,114 +565,770 @@ def _chart_decision_rationale_scheduling(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Chart 6 — Orderbook depth utilisation (intraday only)
+# Chart 4 — Spread duration (intraday only)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def _chart_orderbook_utilisation(
+def _chart_spread_duration(
     df_out: pd.DataFrame,
     df_in: pd.DataFrame,
     n_segments: int,
+    cycling_penalty: float,
+    transaction_cost: float,
+    efficiency: float,
 ) -> plt.Figure:
-    """What fraction of each orderbook level's available volume was traded.
+    """How much profitable round-trip spread the orderbook offered.
 
-    Reveals whether the optimiser is volume-constrained at the best prices
-    (level 1) or has headroom, and how aggressively it reaches into deeper,
-    less favourable levels.
+    Top: best bid/ask price-duration curves (sorted), with the volume-weighted
+    prices the battery actually charged/discharged at.  Bottom: the sorted
+    round-trip gross spread against the break-even threshold — the shaded area
+    is every interval where cycling cleared its cost.
     """
-    t = _time_axis(df_out)
     n = len(df_out)
+    if (
+        n == 0
+        or "bid_prices[1]" not in df_in.columns
+        or "ask_prices[1]" not in df_in.columns
+    ):
+        fig, axes = _make_fig(1, "Spread Duration — no orderbook data")
+        axes[0].text(
+            0.5, 0.5, "No orderbook price data available",
+            ha="center", va="center", transform=axes[0].transAxes, color=_C["text"],
+        )
+        fig.tight_layout()
+        return fig
 
-    fig, axes = _make_fig(2, f"Orderbook Depth Utilisation ({n_segments} levels)")
+    best_bid = df_in["bid_prices[1]"].to_numpy(dtype=float)[:n]
+    best_ask = df_in["ask_prices[1]"].to_numpy(dtype=float)[:n]
 
-    # Build utilisation matrices: shape (n_segments, n)
-    bid_util = np.zeros((n_segments, n))
-    ask_util = np.zeros((n_segments, n))
-
+    charge_mw = 0.0
+    charge_val = 0.0
+    discharge_mw = 0.0
+    discharge_val = 0.0
     for seg in range(1, n_segments + 1):
-        bid_vol_col = f"bid_volumes[{seg}]"
-        ask_vol_col = f"ask_volumes[{seg}]"
-        bid_pw_col = f"discharge_power_bids[{seg}]"
-        ask_pw_col = f"charge_power_asks[{seg}]"
+        ask_pw, ap = f"charge_power_asks[{seg}]", f"ask_prices[{seg}]"
+        bid_pw, bp = f"discharge_power_bids[{seg}]", f"bid_prices[{seg}]"
+        if ask_pw in df_out.columns and ap in df_in.columns:
+            pw = df_out[ask_pw].to_numpy(dtype=float)[:n]
+            charge_mw += float(pw.sum())
+            charge_val += float((pw * df_in[ap].to_numpy(dtype=float)[:n]).sum())
+        if bid_pw in df_out.columns and bp in df_in.columns:
+            pw = df_out[bid_pw].to_numpy(dtype=float)[:n]
+            discharge_mw += float(pw.sum())
+            discharge_val += float((pw * df_in[bp].to_numpy(dtype=float)[:n]).sum())
+    vwap_charge = charge_val / charge_mw if charge_mw > 1e-9 else None
+    vwap_discharge = discharge_val / discharge_mw if discharge_mw > 1e-9 else None
 
-        if bid_vol_col in df_in.columns and bid_pw_col in df_out.columns:
-            vol = df_in[bid_vol_col].values[:n]
-            pw = df_out[bid_pw_col].values[:n]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                bid_util[seg - 1] = np.where(vol > 0, np.clip(pw / vol, 0.0, 1.0), 0.0)
+    ask_sorted = np.sort(best_ask)  # cheapest charging opportunities first
+    bid_sorted = np.sort(best_bid)[::-1]  # best discharge opportunities first
+    rank = np.arange(1, n + 1)
 
-        if ask_vol_col in df_in.columns and ask_pw_col in df_out.columns:
-            vol = df_in[ask_vol_col].values[:n]
-            pw = df_out[ask_pw_col].values[:n]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                ask_util[seg - 1] = np.where(vol > 0, np.clip(pw / vol, 0.0, 1.0), 0.0)
+    sqrt_eff = efficiency**0.5 if efficiency > 0 else 1.0
+    spread_curve = bid_sorted - ask_sorted
+    mid = float(np.median(np.concatenate([best_bid, best_ask])))
+    breakeven = 2.0 * (cycling_penalty + transaction_cost) + mid * (
+        1.0 / sqrt_eff - sqrt_eff
+    )
+    n_profitable = int(np.sum(spread_curve > breakeven))
 
-    # Show as heatmaps
+    fig, axes = _make_fig(
+        2, "Spread Duration — How Much Profitable Spread the Market Offered"
+    )
+
     ax = axes[0]
-    if n_segments > 0:
-        im = ax.imshow(
-            bid_util,
-            aspect="auto",
-            cmap="Greens",
-            vmin=0.0,
-            vmax=1.0,
-            interpolation="nearest",
-            extent=[
-                t[0] if len(t) else 0,
-                t[-1] if len(t) else n,
-                n_segments + 0.5,
-                0.5,
-            ],
+    ax.plot(
+        rank, ask_sorted, color=_C["charge"], linewidth=1.8,
+        label="Ask price (sorted cheap → dear)",
+    )
+    ax.plot(
+        rank, bid_sorted, color=_C["discharge"], linewidth=1.8,
+        label="Bid price (sorted high → low)",
+    )
+    if vwap_charge is not None:
+        ax.axhline(
+            vwap_charge, color=_C["charge"], linestyle="--", linewidth=1.0,
+            label=f"Avg charge price ({vwap_charge:.1f})",
         )
-        ax.set_yticks(range(1, n_segments + 1))
-        ax.set_yticklabels(
-            [f"Bid L{i}" for i in range(1, n_segments + 1)],
-            fontsize=8,
-            color=_C["text"],
+    if vwap_discharge is not None:
+        ax.axhline(
+            vwap_discharge, color=_C["discharge"], linestyle="--", linewidth=1.0,
+            label=f"Avg discharge price ({vwap_discharge:.1f})",
         )
-        ax.tick_params(colors=_C["text"])
-        ax.set_title(
-            "Discharge bid utilisation (0 = unused, 1 = full)",
-            color=_C["text"],
-            fontsize=9,
-        )
-        cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
-        cbar.ax.tick_params(colors=_C["text"])
+    ax.legend(fontsize=7, loc="upper right")
+    ax.set_title("Best bid / ask price-duration curves", color=_C["text"], fontsize=9)
+    _label_axes(ax, "Price (EUR/MWh)", xlabel="")
 
     ax2 = axes[1]
-    if n_segments > 0:
-        im2 = ax2.imshow(
-            ask_util,
-            aspect="auto",
-            cmap="Reds",
-            vmin=0.0,
-            vmax=1.0,
-            interpolation="nearest",
-            extent=[
-                t[0] if len(t) else 0,
-                t[-1] if len(t) else n,
-                n_segments + 0.5,
-                0.5,
-            ],
-        )
-        ax2.set_yticks(range(1, n_segments + 1))
-        ax2.set_yticklabels(
-            [f"Ask L{i}" for i in range(1, n_segments + 1)],
+    ax2.fill_between(
+        rank, breakeven, spread_curve, where=spread_curve > breakeven,
+        color=_C["discharge"], alpha=0.25,
+    )
+    ax2.plot(
+        rank, spread_curve, color=_C["neutral"], linewidth=1.8,
+        label="Round-trip gross spread (sorted)",
+    )
+    ax2.axhline(
+        breakeven, color=_C["warn"], linestyle="--", linewidth=1.2,
+        label=f"Break-even spread ({breakeven:.1f} EUR/MWh)",
+    )
+    ax2.axhline(0, color=_C["text"], linewidth=0.8)
+    ax2.legend(fontsize=7, loc="upper right")
+    _label_axes(ax2, "Spread (EUR/MWh)", xlabel="Interval rank")
+
+    fig.canvas.draw()
+    if n_profitable > 0 and spread_curve.size:
+        placed: list[tuple[float, float, float, float]] = []
+        _place_label(
+            ax2,
+            max(1.0, n_profitable / 2.0),
+            breakeven + (float(spread_curve.max()) - breakeven) * 0.4,
+            f"{n_profitable} of {n} intervals\nclear break-even",
+            placed=placed,
             fontsize=8,
             color=_C["text"],
+            ec=_C["neutral"],
+            x_range=(1.0, float(n)),
         )
-        ax2.tick_params(colors=_C["text"])
-        ax2.set_title(
-            "Charge ask utilisation (0 = unused, 1 = full)",
-            color=_C["text"],
-            fontsize=9,
-        )
-        ax2.set_xlabel("Time (hours)", color=_C["text"], fontsize=9)
-        cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.02, pad=0.02)
-        cbar2.ax.tick_params(colors=_C["text"])
 
     fig.tight_layout()
     return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chart 5 — Committed position (intraday only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _chart_committed_position(
+    df_out: pd.DataFrame,
+    df_in: pd.DataFrame,
+    prob: "OptimizationProblem",
+) -> plt.Figure:
+    """Committed obligation vs discretionary trades, and the feasibility it forces.
+
+    Top: per-interval committed power (the inherited obligation) with the
+    optimiser's incremental trades stacked on top.  Bottom: the actual SoC
+    against the SoC the committed schedule alone would produce — where the
+    latter dips below zero, the SoC ≥ 0 constraint forces compensating charging.
+    """
+    n = len(df_out)
+    dt = _dt_hours(df_out)
+    efficiency = _param(prob, "efficiency", 0.81)
+    capacity = _param(prob, "capacity", 100.0)
+    st = _committed_position_stats(df_out, df_in, dt, efficiency, capacity)
+
+    t = _time_axis(df_out)
+    width = (t[1] - t[0]) * 0.8 if len(t) > 1 else 0.8
+
+    fig, axes = _make_fig(
+        2, "Committed Position — Inherited Obligation vs Discretionary Trades"
+    )
+
+    ax = axes[0]
+    ax.bar(
+        t, st["committed_discharge"], width=width, color=_C["discharge"],
+        label="Committed discharge (obligation)",
+    )
+    ax.bar(
+        t, -st["committed_charge"], width=width, color=_C["charge"],
+        label="Committed charge (obligation)",
+    )
+    ax.bar(
+        t, st["incr_discharge"], width=width, bottom=st["committed_discharge"],
+        color=_C["neutral"], alpha=0.75, label="Incremental discharge (traded)",
+    )
+    ax.bar(
+        t, -st["incr_charge"], width=width, bottom=-st["committed_charge"],
+        color=_C["warn"], alpha=0.75, label="Incremental charge (traded)",
+    )
+    ax.axhline(0, color=_C["text"], linewidth=0.8)
+    ax.legend(fontsize=7, loc="upper right")
+    ax.set_title(
+        "Power per interval — discharge positive, charge negative",
+        color=_C["text"], fontsize=9,
+    )
+    _label_axes(ax, "Power (MW)", xlabel="")
+
+    ax2 = axes[1]
+    actual = st["actual_soc"][:n]
+    committed_soc = st["committed_soc"][:n]
+    ax2.plot(t, actual, color=_C["neutral"], linewidth=1.8, label="Actual SoC")
+    ax2.plot(
+        t, committed_soc, color=_C["charge"], linewidth=1.5, linestyle="--",
+        label="SoC if only the committed schedule ran",
+    )
+    ax2.fill_between(
+        t, 0, np.minimum(committed_soc, 0.0), color=_C["charge"], alpha=0.2
+    )
+    ax2.axhline(0, color=_C["text"], linewidth=0.8)
+    ax2.axhline(
+        capacity, color=_C["warn"], linewidth=1.0, linestyle=":",
+        label=f"Capacity ({capacity:.0f} MWh)",
+    )
+    ax2.legend(fontsize=7, loc="upper right")
+    ax2.set_title(
+        "Where the committed-only SoC breaches 0, charging is required for "
+        "feasibility",
+        color=_C["text"], fontsize=9,
+    )
+    _label_axes(ax2, "State of Charge (MWh)")
+
+    fig.tight_layout()
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Reasoning data — components, cycles, tables, metrics (no rendering)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _dt_hours(df: pd.DataFrame, default: float = 0.25) -> float:
+    t = _time_axis(df)
+    return float(t[1] - t[0]) if len(t) > 1 else default
+
+
+def _revenue_components_intraday(
+    df_out: pd.DataFrame,
+    df_in: pd.DataFrame,
+    n_segments: int,
+    cycling_penalty: float,
+    transaction_cost: float,
+    dt: float,
+) -> dict[str, np.ndarray]:
+    """Per-interval cashflow components (EUR) for the intraday solver."""
+    n = len(df_out)
+    # The intraday objective (bess_intraday.py:path_objective) scores only
+    # INCREMENTAL trades — the per-segment charge_power_asks / discharge_power_bids
+    # decision variables.  The committed position enters the model purely as a
+    # fixed input to the SoC dynamics and carries no price, so it incurs neither
+    # revenue nor any penalty.  Every term below is therefore computed on
+    # incremental flows, mirroring the solver's own objective exactly.
+    incr_charge = np.zeros(n)
+    incr_discharge = np.zeros(n)
+    discharge_rev = np.zeros(n)
+    charge_cost = np.zeros(n)
+    for seg in range(1, n_segments + 1):
+        bid_col, bp = f"discharge_power_bids[{seg}]", f"bid_prices[{seg}]"
+        ask_col, ap = f"charge_power_asks[{seg}]", f"ask_prices[{seg}]"
+        if bid_col in df_out.columns:
+            bid_pw = df_out[bid_col].to_numpy(dtype=float)[:n]
+            incr_discharge += bid_pw
+            if bp in df_in.columns:
+                discharge_rev += bid_pw * df_in[bp].to_numpy(dtype=float)[:n]
+        if ask_col in df_out.columns:
+            ask_pw = df_out[ask_col].to_numpy(dtype=float)[:n]
+            incr_charge += ask_pw
+            if ap in df_in.columns:
+                charge_cost += ask_pw * df_in[ap].to_numpy(dtype=float)[:n]
+    discharge_rev = discharge_rev * dt
+    charge_cost = charge_cost * dt
+    fee_in = (
+        df_in["grid_fee_in"].to_numpy(dtype=float)[:n]
+        if "grid_fee_in" in df_in.columns
+        else np.zeros(n)
+    )
+    fee_out = (
+        df_in["grid_fee_out"].to_numpy(dtype=float)[:n]
+        if "grid_fee_out" in df_in.columns
+        else np.zeros(n)
+    )
+    cycling = cycling_penalty * (incr_charge + incr_discharge) * dt
+    transaction = transaction_cost * (incr_charge + incr_discharge) * dt
+    grid_fee = (fee_in * incr_charge + fee_out * incr_discharge) * dt
+    gross = discharge_rev - charge_cost
+    return {
+        "discharge_rev": discharge_rev,
+        "charge_cost": charge_cost,
+        "gross_rev": gross,
+        "cycling": cycling,
+        "transaction": transaction,
+        "grid_fee": grid_fee,
+        "net": gross - cycling - transaction - grid_fee,
+        "incr_charge": incr_charge,
+        "incr_discharge": incr_discharge,
+    }
+
+
+def _revenue_components_scheduling(
+    df_out: pd.DataFrame,
+    df_in: pd.DataFrame,
+    cycling_penalty: float,
+    dt: float,
+) -> dict[str, np.ndarray]:
+    """Per-interval cashflow components (EUR) for the scheduling solver."""
+    n = len(df_out)
+    charge = df_out["charge_power"].to_numpy(dtype=float)
+    discharge = df_out["discharge_power"].to_numpy(dtype=float)
+    price = (
+        df_in["price"].to_numpy(dtype=float)[:n]
+        if "price" in df_in.columns
+        else np.zeros(n)
+    )
+    fee_in = (
+        df_in["grid_fee_in"].to_numpy(dtype=float)[:n]
+        if "grid_fee_in" in df_in.columns
+        else np.zeros(n)
+    )
+    fee_out = (
+        df_in["grid_fee_out"].to_numpy(dtype=float)[:n]
+        if "grid_fee_out" in df_in.columns
+        else np.zeros(n)
+    )
+    discharge_rev = discharge * price * dt
+    charge_cost = charge * price * dt
+    cycling = cycling_penalty * (charge + discharge) * dt
+    grid_fee = (fee_in * charge + fee_out * discharge) * dt
+    gross = discharge_rev - charge_cost
+    return {
+        "discharge_rev": discharge_rev,
+        "charge_cost": charge_cost,
+        "gross_rev": gross,
+        "cycling": cycling,
+        "transaction": np.zeros(n),
+        "grid_fee": grid_fee,
+        "net": gross - cycling - grid_fee,
+    }
+
+
+def _simulate_soc(
+    charge: np.ndarray,
+    discharge: np.ndarray,
+    soc0: float,
+    efficiency: float,
+    dt_hours: float,
+) -> np.ndarray:
+    """Integrate the model's SoC equation for a given charge/discharge profile.
+
+    Mirrors ``BESSIntraday.mo``: ``3600*der(soc) = charge*sqrt(eff)
+    - discharge/sqrt(eff)``.  Returns SoC at each interval boundary
+    (length ``len(charge) + 1``).
+    """
+    sqrt_eff = efficiency**0.5 if efficiency > 0 else 1.0
+    soc = np.empty(len(charge) + 1)
+    soc[0] = soc0
+    s = soc0
+    for i in range(len(charge)):
+        s += (charge[i] * sqrt_eff - discharge[i] / sqrt_eff) * dt_hours
+        soc[i + 1] = s
+    return soc
+
+
+def _committed_position_stats(
+    df_out: pd.DataFrame,
+    df_in: pd.DataFrame,
+    dt_hours: float,
+    efficiency: float,
+    capacity: float,
+) -> dict[str, Any]:
+    """Split battery activity into the inherited committed obligation and the
+    optimiser's discretionary incremental trades.
+
+    The committed position (``committed_charge`` / ``committed_discharge``) is a
+    fixed model input; ``charge_power`` / ``discharge_power`` are the gross
+    flows, and the Modelica model guarantees gross = committed + incremental, so
+    incremental = gross − committed.
+
+    ``forced_charge_mwh`` is derived purely from the optimiser's own constraint
+    set: simulating the committed schedule alone against the SoC dynamics, the
+    depth it breaches below the SoC ≥ 0 floor is the charging any feasible
+    solution must add — a property of the constraints, independent of price.
+    """
+    n = len(df_out)
+    charge = df_out["charge_power"].to_numpy(dtype=float)
+    discharge = df_out["discharge_power"].to_numpy(dtype=float)
+    soc = df_out["soc"].to_numpy(dtype=float)
+    committed_charge = (
+        df_in["committed_charge"].to_numpy(dtype=float)[:n]
+        if "committed_charge" in df_in.columns
+        else np.zeros(n)
+    )
+    committed_discharge = (
+        df_in["committed_discharge"].to_numpy(dtype=float)[:n]
+        if "committed_discharge" in df_in.columns
+        else np.zeros(n)
+    )
+    incr_charge = np.clip(charge - committed_charge, 0.0, None)
+    incr_discharge = np.clip(discharge - committed_discharge, 0.0, None)
+    soc0 = float(soc[0]) if n else 0.0
+    committed_soc = _simulate_soc(
+        committed_charge, committed_discharge, soc0, efficiency, dt_hours
+    )
+    trough = float(np.min(committed_soc)) if committed_soc.size else soc0
+    trough_idx = int(np.argmin(committed_soc)) if committed_soc.size else 0
+    committed_charged = float(np.sum(committed_charge)) * dt_hours
+    committed_discharged = float(np.sum(committed_discharge)) * dt_hours
+    gross_throughput = float(np.sum(charge + discharge)) * dt_hours
+    committed_throughput = committed_charged + committed_discharged
+    return {
+        "committed_charge": committed_charge,
+        "committed_discharge": committed_discharge,
+        "incr_charge": incr_charge,
+        "incr_discharge": incr_discharge,
+        "committed_soc": committed_soc,
+        "actual_soc": soc,
+        "committed_charged_mwh": committed_charged,
+        "committed_discharged_mwh": committed_discharged,
+        "committed_net_mwh": committed_discharged - committed_charged,
+        "incremental_charged_mwh": float(np.sum(incr_charge)) * dt_hours,
+        "incremental_discharged_mwh": float(np.sum(incr_discharge)) * dt_hours,
+        "n_committed_intervals": int(
+            np.sum((committed_charge > 0.01) | (committed_discharge > 0.01))
+        ),
+        "peak_committed_charge_mw": float(np.max(committed_charge)) if n else 0.0,
+        "peak_committed_discharge_mw": (
+            float(np.max(committed_discharge)) if n else 0.0
+        ),
+        "committed_share_of_throughput": (
+            committed_throughput / gross_throughput
+            if gross_throughput > 1e-9
+            else 0.0
+        ),
+        "committed_soc_trough_mwh": trough,
+        "committed_soc_trough_interval": trough_idx,
+        "forced_charge_mwh": max(0.0, -trough),
+    }
+
+
+def _detect_episodes(
+    charge: np.ndarray, discharge: np.ndarray, min_power: float = 0.01
+) -> list[dict[str, Any]]:
+    """Group consecutive intervals into charge / discharge episodes.
+
+    Idle intervals (both flows below *min_power*) break episodes.  When both
+    flows are active in one interval the dominant one classifies it.
+    """
+    episodes: list[dict[str, Any]] = []
+    cur_kind: str | None = None
+    cur: list[int] = []
+    for i in range(len(charge)):
+        c = charge[i] > min_power
+        d = discharge[i] > min_power
+        if c and d:
+            kind: str | None = "discharge" if discharge[i] >= charge[i] else "charge"
+        elif c:
+            kind = "charge"
+        elif d:
+            kind = "discharge"
+        else:
+            kind = None
+        if kind != cur_kind:
+            if cur and cur_kind is not None:
+                episodes.append({"kind": cur_kind, "ptus": cur})
+            cur = []
+            cur_kind = kind
+        if kind is not None:
+            cur.append(i)
+    if cur and cur_kind is not None:
+        episodes.append({"kind": cur_kind, "ptus": cur})
+    return episodes
+
+
+def _ptu_label(episode: dict[str, Any] | None) -> str:
+    if not episode or not episode["ptus"]:
+        return "—"
+    ptus = episode["ptus"]
+    if ptus[0] == ptus[-1]:
+        return f"#{ptus[0]}"
+    return f"#{ptus[0]}–#{ptus[-1]}"
+
+
+def _build_cycle_rows(
+    episodes: list[dict[str, Any]],
+    comp: dict[str, np.ndarray],
+    charge: np.ndarray,
+    discharge: np.ndarray,
+    dt: float,
+    capacity: float,
+) -> list[dict[str, Any]]:
+    """Pair charge/discharge episodes into cycles and rank them by net margin.
+
+    A cycle is a charge episode paired with a later discharge episode.
+    Pairing is FIFO — the earliest unconsumed charge is matched to the next
+    discharge — which mirrors the natural buy-then-sell arbitrage order.
+    Unpaired episodes (discharging the initial SoC, or charging for the next
+    horizon) are kept as standalone rows.  Rows are sorted descending by net
+    margin — the merit order — so diminishing returns of successive cycles
+    are visible.
+    """
+    pending: list[dict[str, Any]] = []
+    pairs: list[tuple[dict | None, dict | None]] = []
+    for ep in episodes:
+        if ep["kind"] == "charge":
+            pending.append(ep)
+        else:  # discharge — FIFO: match the earliest unconsumed charge
+            pairs.append((pending.pop(0) if pending else None, ep))
+    for ep in pending:
+        pairs.append((ep, None))
+
+    rows: list[dict[str, Any]] = []
+    for ch, dis in pairs:
+        ptus = (ch["ptus"] if ch else []) + (dis["ptus"] if dis else [])
+        charge_eur = sum(comp["charge_cost"][i] for i in (ch["ptus"] if ch else []))
+        discharge_eur = sum(
+            comp["discharge_rev"][i] for i in (dis["ptus"] if dis else [])
+        )
+        cycling_eur = sum(comp["cycling"][i] for i in ptus)
+        transaction_eur = sum(comp["transaction"][i] for i in ptus)
+        fee_eur = sum(comp["grid_fee"][i] for i in ptus)
+        net = discharge_eur - charge_eur - cycling_eur - transaction_eur - fee_eur
+        throughput = sum(charge[i] + discharge[i] for i in ptus) * dt
+        rows.append(
+            {
+                "kind": "cycle"
+                if ch and dis
+                else ("charge-only" if ch else "discharge-only"),
+                "charge_label": _ptu_label(ch),
+                "discharge_label": _ptu_label(dis),
+                "charge_eur": float(charge_eur),
+                "discharge_eur": float(discharge_eur),
+                "cycling_eur": float(cycling_eur),
+                "transaction_eur": float(transaction_eur),
+                "grid_fee_eur": float(fee_eur),
+                "net_eur": float(net),
+                "equiv_cycles": float(throughput / (2.0 * capacity))
+                if capacity > 0
+                else 0.0,
+            }
+        )
+
+    rows.sort(key=lambda r: r["net_eur"], reverse=True)
+    cumulative = 0.0
+    for rank, row in enumerate(rows, start=1):
+        cumulative += row["net_eur"]
+        row["rank"] = rank
+        row["cumulative_eur"] = cumulative
+    return rows
+
+
+def _solver_stats(prob: "OptimizationProblem") -> dict[str, Any]:
+    """Extract solver status / objective / timing — formerly the shadow_prices panel."""
+    out: dict[str, Any] = {}
+    try:
+        stats = prob.solver_stats
+        out["solver_status"] = stats.get("return_status", "unknown")
+        out["solver_wall_time"] = _safe_float(
+            stats.get("t_wall_total") or stats.get("t_wall_solver")
+        )
+    except Exception:
+        out["solver_status"] = "unknown"
+        out["solver_wall_time"] = None
+    out["objective_value"] = _safe_float(getattr(prob, "objective_value", None))
+    try:
+        _, lam_x = prob.lagrange_multipliers
+        out["n_nlp_variables"] = (
+            int(len(np.array(lam_x).ravel())) if lam_x is not None else None
+        )
+    except Exception:
+        out["n_nlp_variables"] = None
+    return out
+
+
+def _constraint_binding_stats(
+    df_out: pd.DataFrame, prob: "OptimizationProblem"
+) -> list[dict[str, Any]]:
+    """How often each physical limit is binding — replaces the heatmap chart."""
+    n = len(df_out)
+    capacity = _param(prob, "capacity", 100.0)
+    max_power = _param(prob, "max_power", 50.0)
+    soc = df_out["soc"].to_numpy(dtype=float)
+    charge = df_out["charge_power"].to_numpy(dtype=float)
+    discharge = df_out["discharge_power"].to_numpy(dtype=float)
+
+    rows: list[dict[str, Any]] = []
+
+    def _row(label: str, mask: np.ndarray) -> None:
+        count = int(np.sum(mask))
+        rows.append(
+            {
+                "constraint": label,
+                "count": count,
+                "intervals": n,
+                "pct": (100.0 * count / n) if n else 0.0,
+            }
+        )
+
+    _row("SoC at full capacity", soc >= capacity * 0.99)
+    _row("SoC fully drained", soc <= capacity * 0.01)
+    _row("Charge power at limit", charge >= max_power * 0.99)
+    _row("Discharge power at limit", discharge >= max_power * 0.99)
+    _row("Battery active (charging or discharging)", (charge > 0.01) | (discharge > 0.01))
+    return rows
+
+
+def _orderbook_depth_stats(
+    df_out: pd.DataFrame, df_in: pd.DataFrame, n_segments: int
+) -> list[dict[str, Any]]:
+    """Average fill per orderbook level — replaces the two utilisation heatmaps."""
+    n = len(df_out)
+    rows: list[dict[str, Any]] = []
+    for seg in range(1, n_segments + 1):
+        ask_pw, ask_vol = f"charge_power_asks[{seg}]", f"ask_volumes[{seg}]"
+        bid_pw, bid_vol = f"discharge_power_bids[{seg}]", f"bid_volumes[{seg}]"
+        charge_fill = discharge_fill = 0.0
+        charge_sum = discharge_sum = 0.0
+        if ask_pw in df_out.columns:
+            pw = df_out[ask_pw].to_numpy(dtype=float)
+            charge_sum = float(pw.sum())
+            if ask_vol in df_in.columns:
+                vol = df_in[ask_vol].to_numpy(dtype=float)[:n]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    frac = np.where(vol > 0, np.clip(pw / vol, 0.0, 1.0), 0.0)
+                charge_fill = float(np.mean(frac)) * 100.0 if n else 0.0
+        if bid_pw in df_out.columns:
+            pw = df_out[bid_pw].to_numpy(dtype=float)
+            discharge_sum = float(pw.sum())
+            if bid_vol in df_in.columns:
+                vol = df_in[bid_vol].to_numpy(dtype=float)[:n]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    frac = np.where(vol > 0, np.clip(pw / vol, 0.0, 1.0), 0.0)
+                discharge_fill = float(np.mean(frac)) * 100.0 if n else 0.0
+        rows.append(
+            {
+                "level": seg,
+                "charge_fill_pct": charge_fill,
+                "discharge_fill_pct": discharge_fill,
+                "charge_mw_sum": charge_sum,
+                "discharge_mw_sum": discharge_sum,
+            }
+        )
+    return rows
+
+
+def _schedule_rows_scheduling(
+    df_out: pd.DataFrame, df_in: pd.DataFrame
+) -> list[dict[str, Any]]:
+    """Per-interval action table for the scheduling full-day schedule."""
+    n = len(df_out)
+    price = (
+        df_in["price"].to_numpy(dtype=float)[:n]
+        if "price" in df_in.columns
+        else np.zeros(n)
+    )
+    soc = df_out["soc"].to_numpy(dtype=float)
+    charge = df_out["charge_power"].to_numpy(dtype=float)
+    discharge = df_out["discharge_power"].to_numpy(dtype=float)
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
+        if charge[i] > 0.01:
+            action, mw = "Charge", float(charge[i])
+        elif discharge[i] > 0.01:
+            action, mw = "Discharge", float(discharge[i])
+        else:
+            action, mw = "Idle", 0.0
+        rows.append(
+            {
+                "interval": i,
+                "price": float(price[i]),
+                "action": action,
+                "mw": mw,
+                "soc": float(soc[i]),
+            }
+        )
+    return rows
+
+
+def _collect_intraday_metrics(
+    df_out: pd.DataFrame,
+    df_in: pd.DataFrame,
+    n_segments: int,
+    cycling_penalty: float,
+    transaction_cost: float,
+    prob: "OptimizationProblem",
+) -> dict[str, Any]:
+    """Scalar KPIs for the intraday run — the structured backtest record."""
+    n = len(df_out)
+    dt = _dt_hours(df_out)
+    charge = df_out["charge_power"].to_numpy(dtype=float)
+    discharge = df_out["discharge_power"].to_numpy(dtype=float)
+    soc = df_out["soc"].to_numpy(dtype=float)
+    capacity = _param(prob, "capacity", 100.0)
+    comp = _revenue_components_intraday(
+        df_out, df_in, n_segments, cycling_penalty, transaction_cost, dt
+    )
+    total_charged = float(np.sum(charge)) * dt
+    total_discharged = float(np.sum(discharge)) * dt
+    throughput = total_charged + total_discharged
+    metrics: dict[str, Any] = {
+        "horizon_intervals": n,
+        "interval_minutes": dt * 60.0,
+        "cycling_penalty_factor": cycling_penalty,
+        "transaction_cost": transaction_cost,
+        "capacity_mwh": capacity,
+        "total_charged_mwh": total_charged,
+        "total_discharged_mwh": total_discharged,
+        "throughput_mwh": throughput,
+        "equivalent_full_cycles": throughput / (2.0 * capacity)
+        if capacity > 0
+        else 0.0,
+        "total_revenue_eur": float(np.sum(comp["gross_rev"])),
+        "total_cycling_penalty_eur": float(np.sum(comp["cycling"])),
+        "total_transaction_cost_eur": float(np.sum(comp["transaction"])),
+        "total_grid_fee_eur": float(np.sum(comp["grid_fee"])),
+        "n_charge_intervals": int(np.sum(charge > 0.01)),
+        "n_discharge_intervals": int(np.sum(discharge > 0.01)),
+        "initial_soc_mwh": float(soc[0]) if n else 0.0,
+        "final_soc_mwh": float(soc[-1]) if n else 0.0,
+    }
+    metrics["net_profit_eur"] = (
+        metrics["total_revenue_eur"]
+        - metrics["total_cycling_penalty_eur"]
+        - metrics["total_transaction_cost_eur"]
+        - metrics["total_grid_fee_eur"]
+    )
+    # Committed-position breakdown: scalar keys only (drop the array entries).
+    efficiency = _param(prob, "efficiency", 0.81)
+    for key, val in _committed_position_stats(
+        df_out, df_in, dt, efficiency, capacity
+    ).items():
+        if not isinstance(val, np.ndarray):
+            metrics[key] = val
+    metrics.update(_solver_stats(prob))
+    return metrics
+
+
+def _collect_scheduling_metrics(
+    df_out: pd.DataFrame,
+    df_in: pd.DataFrame,
+    cycling_penalty: float,
+    prob: "OptimizationProblem",
+) -> dict[str, Any]:
+    """Scalar KPIs for the scheduling run."""
+    n = len(df_out)
+    dt = _dt_hours(df_out, default=1.0)
+    charge = df_out["charge_power"].to_numpy(dtype=float)
+    discharge = df_out["discharge_power"].to_numpy(dtype=float)
+    soc = df_out["soc"].to_numpy(dtype=float)
+    capacity = _param(prob, "capacity", 100.0)
+    comp = _revenue_components_scheduling(df_out, df_in, cycling_penalty, dt)
+    total_charged = float(np.sum(charge)) * dt
+    total_discharged = float(np.sum(discharge)) * dt
+    throughput = total_charged + total_discharged
+    metrics: dict[str, Any] = {
+        "horizon_intervals": n,
+        "interval_minutes": dt * 60.0,
+        "cycling_penalty_factor": cycling_penalty,
+        "capacity_mwh": capacity,
+        "total_charged_mwh": total_charged,
+        "total_discharged_mwh": total_discharged,
+        "throughput_mwh": throughput,
+        "equivalent_full_cycles": throughput / (2.0 * capacity)
+        if capacity > 0
+        else 0.0,
+        "total_revenue_eur": float(np.sum(comp["gross_rev"])),
+        "total_cycling_penalty_eur": float(np.sum(comp["cycling"])),
+        "total_grid_fee_eur": float(np.sum(comp["grid_fee"])),
+        "n_charge_intervals": int(np.sum(charge > 0.01)),
+        "n_discharge_intervals": int(np.sum(discharge > 0.01)),
+        "initial_soc_mwh": float(soc[0]) if n else 0.0,
+        "final_soc_mwh": float(soc[-1]) if n else 0.0,
+    }
+    metrics["net_profit_eur"] = (
+        metrics["total_revenue_eur"]
+        - metrics["total_cycling_penalty_eur"]
+        - metrics["total_grid_fee_eur"]
+    )
+    metrics.update(_solver_stats(prob))
+    return metrics
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -897,20 +1336,24 @@ def _chart_orderbook_utilisation(
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _strip_dummy(df_full: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Strip the prepended dummy row + endpoint row (same logic as rtc_to_pe)."""
+    if len(df_full) > n:
+        return df_full.iloc[1 : n + 1].reset_index(drop=True)
+    return df_full.copy()
+
+
 def build_scheduling_diagnostics(
-    output_dir: Any,  # pathlib.Path — kept as Any to avoid circular import
+    output_dir: Any,
     model_input: dict[str, Any],
     cycling_penalty: float,
     prob: "OptimizationProblem",
-) -> tuple[dict[str, str], list[str]]:
-    """Generate all scheduling explainer charts.
+) -> tuple[dict[str, str], list[str], str]:
+    """Generate scheduling explainer charts, table data, and reasoning markdown.
 
-    Returns a tuple of:
-    - ``images``: dict mapping chart name to ``data:image/png;base64,…`` URI
-    - ``info_entries``: list of ``_info`` strings to append to the response
+    Returns ``(images, info_entries, reasoning_markdown)``.
     """
-    import pandas as pd
-    from pathlib import Path
+    from service.translation.reasoning import generate_scheduling_markdown
 
     t_start = time.monotonic()
     images: dict[str, str] = {}
@@ -918,35 +1361,24 @@ def build_scheduling_diagnostics(
 
     output_dir = Path(output_dir)
     csv_path = output_dir / "timeseries_export.csv"
-
     try:
         df_out_full = pd.read_csv(csv_path, parse_dates=["time"])
     except Exception as exc:
         info.append(f"diagnostics: skipped — could not read output CSV: {exc}")
-        return images, info
+        return images, info, ""
 
-    # Strip dummy row + endpoint row (same logic as rtc_to_pe.py)
     interval_start = model_input.get("interval_start", [])
     n = len(interval_start)
-    if len(df_out_full) > n:
-        df_out = df_out_full.iloc[1 : n + 1].reset_index(drop=True)
-    else:
-        df_out = df_out_full.copy()
+    df_out = _strip_dummy(df_out_full, n)
 
-    # Read the input CSV to get price and fee timeseries
     input_dir = output_dir.parent / "input"
     try:
         df_in_full = pd.read_csv(
             input_dir / "timeseries_import.csv", parse_dates=["time"]
         )
-        # The input CSV also has the prepended dummy row; strip it consistently
-        if len(df_in_full) > n:
-            df_in = df_in_full.iloc[1 : n + 1].reset_index(drop=True)
-        else:
-            df_in = df_in_full.copy()
+        df_in = _strip_dummy(df_in_full, n)
     except Exception:
-        # Fall back to zeros if input CSV is not available
-        df_in = pd.DataFrame({"price": np.zeros(n)})
+        df_in = pd.DataFrame({"price": np.zeros(len(df_out))})
 
     chart_fns = [
         (
@@ -955,18 +1387,7 @@ def build_scheduling_diagnostics(
                 df_out, df_in, cycling_penalty
             ),
         ),
-        (
-            "constraint_tightness",
-            lambda: _chart_constraint_tightness(df_out, prob),
-        ),
-        (
-            "soc_headroom",
-            lambda: _chart_soc_headroom(df_out, prob),
-        ),
-        (
-            "shadow_prices",
-            lambda: _chart_shadow_prices(df_out, prob),
-        ),
+        ("soc_headroom", lambda: _chart_soc_headroom(df_out, prob)),
         (
             "decision_rationale",
             lambda: _chart_decision_rationale_scheduling(
@@ -974,14 +1395,10 @@ def build_scheduling_diagnostics(
             ),
         ),
     ]
-
     for name, fn in chart_fns:
         try:
             fig = fn()
             if fig is None:
-                info.append(
-                    f"diagnostics: '{name}' skipped — duals not available for MILP"
-                )
                 continue
             images[name] = _fig_to_b64(fig)
         except Exception as exc:
@@ -992,25 +1409,46 @@ def build_scheduling_diagnostics(
     info.append(
         f"diagnostics: generated {len(images)} scheduling chart(s) in {elapsed_ms}ms"
     )
-    return images, info
+
+    reasoning_markdown = ""
+    try:
+        dt = _dt_hours(df_out, default=1.0)
+        comp = _revenue_components_scheduling(df_out, df_in, cycling_penalty, dt)
+        charge = df_out["charge_power"].to_numpy(dtype=float)
+        discharge = df_out["discharge_power"].to_numpy(dtype=float)
+        episodes = _detect_episodes(charge, discharge)
+        cycle_rows = _build_cycle_rows(
+            episodes, comp, charge, discharge, dt, _param(prob, "capacity", 100.0)
+        )
+        reasoning_markdown = generate_scheduling_markdown(
+            metrics=_collect_scheduling_metrics(df_out, df_in, cycling_penalty, prob),
+            cycle_rows=cycle_rows,
+            constraint_rows=_constraint_binding_stats(df_out, prob),
+            schedule_rows=_schedule_rows_scheduling(df_out, df_in),
+            images=images,
+            info=info,
+            model_input=model_input,
+        )
+    except Exception as exc:
+        _log.warning("Reasoning markdown failed: %s", exc, exc_info=True)
+        info.append(f"diagnostics: reasoning markdown failed — {exc}")
+
+    return images, info, reasoning_markdown
 
 
 def build_intraday_diagnostics(
-    output_dir: Any,  # pathlib.Path
+    output_dir: Any,
     model_input: dict[str, Any],
     n_segments: int,
     cycling_penalty: float,
     transaction_cost: float,
     prob: "OptimizationProblem",
-) -> tuple[dict[str, str], list[str]]:
-    """Generate all intraday explainer charts.
+) -> tuple[dict[str, str], list[str], str]:
+    """Generate intraday explainer charts, table data, and reasoning markdown.
 
-    Returns a tuple of:
-    - ``images``: dict mapping chart name to ``data:image/png;base64,…`` URI
-    - ``info_entries``: list of ``_info`` strings to append to the response
+    Returns ``(images, info_entries, reasoning_markdown)``.
     """
-    import pandas as pd
-    from pathlib import Path
+    from service.translation.reasoning import generate_intraday_markdown
 
     t_start = time.monotonic()
     images: dict[str, str] = {}
@@ -1018,32 +1456,26 @@ def build_intraday_diagnostics(
 
     output_dir = Path(output_dir)
     csv_path = output_dir / "timeseries_export.csv"
-
     try:
         df_out_full = pd.read_csv(csv_path, parse_dates=["time"])
     except Exception as exc:
         info.append(f"diagnostics: skipped — could not read output CSV: {exc}")
-        return images, info
+        return images, info, ""
 
     interval_start = model_input.get("interval_start", [])
     n = len(interval_start)
-    if len(df_out_full) > n:
-        df_out = df_out_full.iloc[1 : n + 1].reset_index(drop=True)
-    else:
-        df_out = df_out_full.copy()
+    df_out = _strip_dummy(df_out_full, n)
 
     input_dir = output_dir.parent / "input"
     try:
         df_in_full = pd.read_csv(
             input_dir / "timeseries_import.csv", parse_dates=["time"]
         )
-        if len(df_in_full) > n:
-            df_in = df_in_full.iloc[1 : n + 1].reset_index(drop=True)
-        else:
-            df_in = df_in_full.copy()
+        df_in = _strip_dummy(df_in_full, n)
     except Exception:
         df_in = pd.DataFrame()
 
+    efficiency = _param(prob, "efficiency", 0.81)
     chart_fns = [
         (
             "revenue_decomposition",
@@ -1051,31 +1483,22 @@ def build_intraday_diagnostics(
                 df_out, df_in, n_segments, cycling_penalty, transaction_cost
             ),
         ),
+        ("soc_headroom", lambda: _chart_soc_headroom(df_out, prob)),
         (
-            "constraint_tightness",
-            lambda: _chart_constraint_tightness(df_out, prob),
+            "spread_duration",
+            lambda: _chart_spread_duration(
+                df_out, df_in, n_segments, cycling_penalty, transaction_cost, efficiency
+            ),
         ),
         (
-            "soc_headroom",
-            lambda: _chart_soc_headroom(df_out, prob),
-        ),
-        (
-            "shadow_prices",
-            lambda: _chart_shadow_prices(df_out, prob),
-        ),
-        (
-            "orderbook_utilisation",
-            lambda: _chart_orderbook_utilisation(df_out, df_in, n_segments),
+            "committed_position",
+            lambda: _chart_committed_position(df_out, df_in, prob),
         ),
     ]
-
     for name, fn in chart_fns:
         try:
             fig = fn()
             if fig is None:
-                info.append(
-                    f"diagnostics: '{name}' skipped — duals not available for MILP"
-                )
                 continue
             images[name] = _fig_to_b64(fig)
         except Exception as exc:
@@ -1086,4 +1509,35 @@ def build_intraday_diagnostics(
     info.append(
         f"diagnostics: generated {len(images)} intraday chart(s) in {elapsed_ms}ms"
     )
-    return images, info
+
+    reasoning_markdown = ""
+    try:
+        dt = _dt_hours(df_out)
+        comp = _revenue_components_intraday(
+            df_out, df_in, n_segments, cycling_penalty, transaction_cost, dt
+        )
+        # Detect cycles on INCREMENTAL flows so the merit order reflects the
+        # optimiser's own trades, not the committed obligation it must deliver.
+        incr_charge = comp["incr_charge"]
+        incr_discharge = comp["incr_discharge"]
+        episodes = _detect_episodes(incr_charge, incr_discharge)
+        cycle_rows = _build_cycle_rows(
+            episodes, comp, incr_charge, incr_discharge, dt,
+            _param(prob, "capacity", 100.0),
+        )
+        reasoning_markdown = generate_intraday_markdown(
+            metrics=_collect_intraday_metrics(
+                df_out, df_in, n_segments, cycling_penalty, transaction_cost, prob
+            ),
+            cycle_rows=cycle_rows,
+            constraint_rows=_constraint_binding_stats(df_out, prob),
+            orderbook_rows=_orderbook_depth_stats(df_out, df_in, n_segments),
+            images=images,
+            info=info,
+            model_input=model_input,
+        )
+    except Exception as exc:
+        _log.warning("Reasoning markdown failed: %s", exc, exc_info=True)
+        info.append(f"diagnostics: reasoning markdown failed — {exc}")
+
+    return images, info, reasoning_markdown

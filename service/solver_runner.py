@@ -130,13 +130,16 @@ def _run_scheduling(
             log_level=logging.WARNING,
         )
 
-        result = translate_scheduling_result(
+        result, reasoning_markdown = translate_scheduling_result(
             base / "output",
             model_input,
             translation.info,
             prob=prob if include_diagnostics else None,
         )
-        return {"result": result}
+        response: dict[str, Any] = {"result": result}
+        if reasoning_markdown:
+            response["reasoning_markdown"] = reasoning_markdown
+        return response
 
 
 # ── intraday ─────────────────────────────────────────────────────────
@@ -190,14 +193,17 @@ def _run_intraday(
             log_level=logging.WARNING,
         )
 
-        result = translate_intraday_result(
+        result, reasoning_markdown = translate_intraday_result(
             base / "output",
             model_input,
             translation.n_segments,
             translation.info,
             prob=prob if include_diagnostics else None,
         )
-        return {"result": result}
+        response: dict[str, Any] = {"result": result}
+        if reasoning_markdown:
+            response["reasoning_markdown"] = reasoning_markdown
+        return response
 
 
 # ── helpers ──────────────────────────────────────────────────────────
