@@ -63,6 +63,22 @@ def submit_sync(model_name: str, body: SubmitRequest) -> dict[str, Any]:
             body.model_input_data,
             include_diagnostics=body.include_diagnostics,
         )
+    except ValueError as exc:
+        # Translation-layer validation errors (e.g. open aFRR market without
+        # the required activation_fraction timeseries) — surface as 422 so
+        # callers can distinguish bad input from genuine solver failure.
+        _log.warning(
+            "Validation failed for model_name=%s: %s", model_name, exc
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "Invalid model_input_data",
+                "model_name": model_name,
+                "solver_type": solver_type,
+                "message": str(exc),
+            },
+        ) from exc
     except Exception as exc:
         _log.exception("Solver failed for model_name=%s", model_name)
         raise HTTPException(

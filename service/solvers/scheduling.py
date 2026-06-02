@@ -24,9 +24,9 @@ class ConfigurableBESS(BESS):
     """BESS solver with runtime-configurable cycling penalty and terminal SoC value.
 
     Battery parameters (``capacity``, ``max_power``, ``efficiency``) are
-    overridden via ``parameters.csv``.  ``cycling_penalty_factor`` and
-    ``stored_energy_value`` need Python-level overrides because they are
-    not Modelica parameters.
+    overridden via ``parameters.csv``.  ``cycling_penalty_factor``,
+    ``stored_energy_value``, and the reserve-market config need Python-level
+    overrides because they are not Modelica parameters.
 
     The ``objective()`` override with terminal SoC valuation lives in the
     base ``BESS`` class.  This subclass only needs to inject the per-request
@@ -35,11 +35,17 @@ class ConfigurableBESS(BESS):
 
     _cycling_penalty: float = 2.0
     _stored_energy_value: float = 0.0
+    _reserve_config: dict | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.cycling_penalty_factor = self.__class__._cycling_penalty
         self.stored_energy_value = self.__class__._stored_energy_value
+        if self.__class__._reserve_config is not None:
+            # Deep-copy so concurrent requests can't mutate each other's state
+            self.reserve_config = {
+                k: dict(v) for k, v in self.__class__._reserve_config.items()
+            }
 
     def post(self):
         # Skip the demo's print statements — we read CSV output directly

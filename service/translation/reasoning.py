@@ -271,6 +271,206 @@ def _why_loss_note(metrics: dict[str, Any]) -> list[str]:
     ]
 
 
+def _reserve_bids_section(reserve_data: dict[str, Any] | None) -> list[str]:
+    """Per-block reserve-bid table with rank and binding-constraint column.
+
+    Emitted only when the run produced at least one non-zero reserve bid.
+    """
+    bid_rows = (reserve_data or {}).get("bid_rows") or []
+    bid_rows = [r for r in bid_rows if (r.get("bid_mw") or 0.0) > 1e-9]
+    if not bid_rows:
+        return []
+    out = ["## Reserve Bids", ""]
+    out.append(
+        "Per (product, 4h-block) bid that the solver placed into the "
+        "currently-open auction.  Rank orders products by EUR per MW within "
+        "the product so the diminishing returns of additional blocks are "
+        "visible.  *Binding* names the constraint that capped the bid below "
+        "``max_power`` (empty when the bid was the discretionary optimum)."
+    )
+    out.append("")
+    out += _md_table(
+        [
+            "Product", "Block PTUs", "Bid MW", "Standby \u20ac",
+            "Activation \u20ac", "Total \u20ac", "EUR/MW", "Rank",
+        ],
+        [
+            [
+                r["product"],
+                f"#{r['block_start_idx']}–#{r['block_end_idx']}",
+                _num(r["bid_mw"]),
+                _num(r["standby_eur"]),
+                _num(r["activation_eur"]),
+                f"**{_num(r['total_eur'])}**",
+                _num(r["eur_per_mw"]),
+                r.get("rank", "—"),
+            ]
+            for r in bid_rows
+        ],
+    )
+    out.append("")
+    return out
+
+
+def _reserve_shadow_prices_section(reserve_data: dict[str, Any] | None) -> list[str]:
+    """Shadow-price table for open markets (one row per bid block).
+
+    The Lagrange-multiplier proxy column captures the *average* magnitude of
+    the constraint multipliers over the run — a coarse but free
+    approximation that tells the reader whether reserves are squeezing the
+    feasible set tightly or not.
+    """
+    rows = (reserve_data or {}).get("shadow_price_rows") or []
+    if not rows:
+        return []
+    out = ["## Reserve Shadow Prices", ""]
+    out.append(
+        "Per (product, block) marginal-cost diagnostic.  *Binding* names the "
+        "physical constraint that throttled the bid; a non-empty value means "
+        "loosening that constraint by 1 unit would let the solver bid more.  "
+        "The EUR/MW column is an average-multiplier proxy: a higher number "
+        "means the constraint set is tight overall (small relaxations move "
+        "the objective a lot)."
+    )
+    out.append("")
+    out += _md_table(
+        ["Product", "Block PTUs", "Bid MW", "Binding constraint", "~ EUR/MW relaxed"],
+        [
+            [
+                r["product"],
+                f"#{r['block_start_idx']}–#{r['block_end_idx']}",
+                _num(r["bid_mw"]),
+                r["binding_constraint"],
+                _num(r["shadow_proxy_eur_per_mw"], 4),
+            ]
+            for r in rows
+        ],
+    )
+    out.append("")
+    return out
+
+
+def _committed_reserves_section(reserve_data: dict[str, Any] | None) -> list[str]:
+    """Per-product summary of inherited reserve commitments."""
+    rows = (reserve_data or {}).get("committed_rows") or []
+    if not rows:
+        return []
+    out = ["## Committed Reserves", ""]
+    out.append(
+        "Reserve positions inherited from prior auctions.  These do not earn "
+        "*new* standby revenue in this horizon (that revenue was booked when "
+        "they cleared), but they consume power-headroom and SoC-LER capacity "
+        "and contribute to activation revenue and cycling penalty here."
+    )
+    out.append("")
+    out += _md_table(
+        [
+            "Product", "Peak MW", "Avg MW",
+            "Active intervals", "MWh reserved (\u00b7 t_min)",
+        ],
+        [
+            [
+                r["product"],
+                _num(r["peak_mw"]),
+                _num(r["avg_mw"]),
+                f"{r['active_intervals']} / {r['horizon_intervals']}",
+                _num(r["mwh_reserved"]),
+            ]
+            for r in rows
+        ],
+    )
+    out.append("")
+    return out
+
+
+def _counterfactual_section(
+    metrics: dict[str, Any],
+    reserve_data: dict[str, Any] | None,
+) -> list[str]:
+    """Side-by-side comparison: this run versus a "no reserves" re-solve.
+
+    When the counterfactual fired, this is the section that quantifies what
+    reserves contributed (or cost) the portfolio over the horizon.  When
+    the caller suppressed the counterfactual via the
+    ``skip_counterfactual_reserves`` parameter, a brief note is emitted
+    instead of the table.
+    """
+    skip = bool((reserve_data or {}).get("skip_counterfactual_reserves"))
+    cf = (reserve_data or {}).get("counterfactual_metrics")
+    if not (reserve_data or {}).get("config") and not skip and cf is None:
+        return []
+    out = ["## Counterfactual — Without Reserves", ""]
+    if skip:
+        out.append(
+            "*Counterfactual analysis skipped via the "
+            "``skip_counterfactual_reserves`` parameter.  Re-run with "
+            "``parameters[skip_counterfactual_reserves] = 0`` (or unset) "
+            "to see the EUR delta reserves contributed to this horizon.*"
+        )
+        out.append("")
+        return out
+    if cf is None:
+        out.append(
+            "*No counterfactual data available (the re-solve was not triggered "
+            "or failed silently — see solver notes).*"
+        )
+        out.append("")
+        return out
+    out.append(
+        "A second optimisation was executed with all reserve markets stripped "
+        "from the input (no committed positions, no standby or activation "
+        "prices, no aFRR activation drift).  Comparing the two runs isolates "
+        "the EUR impact of reserves on this horizon.  This roughly doubles "
+        "solver wall time; pass "
+        "``parameters[skip_counterfactual_reserves] = 1`` in the request to "
+        "suppress it on subsequent calls."
+    )
+    out.append("")
+    actual_net = metrics.get("net_profit_eur", 0.0) or 0.0
+    cf_net = cf.get("net_profit_eur", 0.0) or 0.0
+    delta_net = actual_net - cf_net
+    rows = [
+        ["Net profit", _eur(actual_net), _eur(cf_net), _eur(delta_net)],
+        [
+            "Arbitrage revenue",
+            _eur(metrics.get("total_revenue_eur")),
+            _eur(cf.get("arbitrage_revenue_eur")),
+            _eur(
+                (metrics.get("total_revenue_eur") or 0.0)
+                - (cf.get("arbitrage_revenue_eur") or 0.0)
+            ),
+        ],
+        [
+            "Throughput",
+            f"{_num(metrics.get('throughput_mwh'))} MWh",
+            f"{_num(cf.get('throughput_mwh'))} MWh",
+            f"{_num((metrics.get('throughput_mwh') or 0.0) - (cf.get('throughput_mwh') or 0.0))} MWh",
+        ],
+        [
+            "Final SoC",
+            f"{_num(metrics.get('final_soc_mwh'))} MWh",
+            f"{_num(cf.get('final_soc_mwh'))} MWh",
+            f"{_num((metrics.get('final_soc_mwh') or 0.0) - (cf.get('final_soc_mwh') or 0.0))} MWh",
+        ],
+    ]
+    out += _md_table(
+        ["Metric", "With reserves (actual)", "Without reserves (counterfactual)", "\u0394"],
+        rows,
+    )
+    out.append("")
+    sign = (
+        "**added value**" if delta_net > 0
+        else "**cost value**" if delta_net < 0
+        else "**were neutral**"
+    )
+    out.append(
+        f"> Reserves {sign} of "
+        f"**{_eur(abs(delta_net))}** over this horizon."
+    )
+    out.append("")
+    return out
+
+
 def _committed_position_section(
     metrics: dict[str, Any], images: dict[str, str]
 ) -> list[str]:
@@ -364,6 +564,7 @@ def generate_intraday_markdown(
     images: dict[str, str],
     info: list[str],
     model_input: dict[str, Any],
+    reserve_data: dict[str, Any] | None = None,
 ) -> str:
     """Build the intraday reasoning-markdown document."""
     L: list[str] = []
@@ -400,6 +601,10 @@ def generate_intraday_markdown(
 
     # ── Committed position ──
     L += _committed_position_section(metrics, images)
+
+    # ── Reserve obligations + counterfactual (intraday has no Bid/Shadow) ──
+    L += _committed_reserves_section(reserve_data)
+    L += _counterfactual_section(metrics, reserve_data)
 
     # ── Per-cycle merit order ──
     L += _cycle_merit_section(cycle_rows, has_tx=True, incremental=True)
@@ -478,6 +683,7 @@ def generate_scheduling_markdown(
     images: dict[str, str],
     info: list[str],
     model_input: dict[str, Any],
+    reserve_data: dict[str, Any] | None = None,
 ) -> str:
     """Build the day-ahead scheduling reasoning-markdown document."""
     L: list[str] = []
@@ -511,6 +717,12 @@ def generate_scheduling_markdown(
 
     # ── Per-cycle merit order ──
     L += _cycle_merit_section(cycle_rows, has_tx=False, incremental=False)
+
+    # ── Reserve bids, shadow prices, committed positions, counterfactual ──
+    L += _reserve_bids_section(reserve_data)
+    L += _reserve_shadow_prices_section(reserve_data)
+    L += _committed_reserves_section(reserve_data)
+    L += _counterfactual_section(metrics, reserve_data)
 
     # ── Energy balance ──
     L.append("## Energy Balance")

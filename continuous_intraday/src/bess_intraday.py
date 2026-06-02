@@ -7,6 +7,19 @@ from rtctools.optimization.modelica_mixin import ModelicaMixin
 from rtctools.util import run_optimization_problem
 
 
+# Default reserve config — intraday never *bids* reserves but it does inherit
+# committed positions from prior auctions and must enforce their LER +
+# power-headroom impact.  ``t_min_hours`` is the LER duration per product
+# (e.g. 15 minutes / 0.25 h for FCR/aFRR).  ``open`` is always False here:
+# every product is pinned to a zero bid because the intraday solver does
+# not decide reserve auctions.
+_DEFAULT_RESERVE_CONFIG: dict[str, dict] = {
+    "fcr":       {"open": False, "t_min_hours": 0.0},
+    "afrr_up":   {"open": False, "t_min_hours": 0.0},
+    "afrr_down": {"open": False, "t_min_hours": 0.0},
+}
+
+
 class BESSIntraday(
     CSVMixin,
     ModelicaMixin,
@@ -33,6 +46,12 @@ class BESSIntraday(
         self.stored_energy_value = (
             0.0  # EUR/MWh value assigned to SoC remaining at horizon end
         )
+        # Reserve configuration; service wrappers override via class attribute.
+        # Intraday never bids reserves; the config is used purely for the LER
+        # duration parameters that scale committed-position headroom.
+        self.reserve_config: dict[str, dict] = {
+            k: dict(v) for k, v in _DEFAULT_RESERVE_CONFIG.items()
+        }
 
     def solver_options(self):
         """Configure solver options for mixed-integer optimization."""
@@ -84,16 +103,40 @@ class BESSIntraday(
         # Transaction costs on total traded volume
         transaction_cost = self.transaction_cost * (total_charge + total_discharge)
 
+        # Activation revenue on committed aFRR positions.  Cleared FCR has no
+        # separate energy revenue (symmetric, paid via standby).  Standby
+        # revenue is excluded — that was earned in the prior auction.  Since
+        # the intraday solver never bids, ``total_<p>`` here equals the
+        # committed position for each product.
+        activation_revenue = (
+            self.state("total_afrr_up")
+            * self.state("afrr_activation_fraction")
+            * self.state("afrr_up_price")
+            + self.state("total_afrr_down")
+            * self.state("afrr_activation_fraction")
+            * self.state("afrr_down_price")
+        )
+
+        # Cycling penalty includes expected throughput from cleared reserve
+        # activations even though the intraday solver did not place them.
+        reserve_cycling = self.cycling_penalty_factor * (
+            2.0 * self.state("total_fcr") * self.state("fcr_activation_fraction")
+            + self.state("total_afrr_up")   * self.state("afrr_activation_fraction")
+            + self.state("total_afrr_down") * self.state("afrr_activation_fraction")
+        )
+
         # Cycling penalty based on total power throughput
         cycling_penalty = self.cycling_penalty_factor * (total_charge + total_discharge)
 
         # Total objective (negative because we want to maximize profit)
         profit = (
             discharge_revenue
+            + activation_revenue
             - charge_cost
             - grid_fee_cost
             - transaction_cost
             - cycling_penalty
+            - reserve_cycling
         )
         return -profit
 
@@ -123,6 +166,8 @@ class BESSIntraday(
         constraints = super().path_constraints(ensemble_member)
 
         parameters = self.parameters(ensemble_member)
+        max_power = parameters["max_power"]
+        capacity = parameters["capacity"]
 
         # Complementarity on incremental trades only.
         #
@@ -153,7 +198,7 @@ class BESSIntraday(
         )
         constraints.append(
             (
-                total_incr_charge - self.state("is_charging") * parameters["max_power"],
+                total_incr_charge - self.state("is_charging") * max_power,
                 -np.inf,
                 0,
             )
@@ -161,7 +206,7 @@ class BESSIntraday(
         constraints.append(
             (
                 total_incr_discharge
-                - self.state("is_discharging") * parameters["max_power"],
+                - self.state("is_discharging") * max_power,
                 -np.inf,
                 0,
             )
@@ -186,6 +231,63 @@ class BESSIntraday(
                 (
                     self.state(f"charge_power_asks[{i + 1}]")
                     - self.state(f"ask_volumes[{i + 1}]"),
+                    -np.inf,
+                    0.0,
+                )
+            )
+
+        # Intraday never bids reserves — pin every bid total to 0 so the
+        # Modelica decision variables collapse to their committed values.
+        for product in ("fcr", "afrr_up", "afrr_down"):
+            constraints.append(
+                (self.state(f"bid_{product}_total"), -np.inf, 0.0)
+            )
+
+        # Reserve power-headroom constraints (committed positions still
+        # squeeze the inverter's available MW for orderbook trades).
+        total_fcr = self.state("total_fcr")
+        total_afrr_up = self.state("total_afrr_up")
+        total_afrr_down = self.state("total_afrr_down")
+
+        constraints.append(
+            (
+                self.state("discharge_power") + total_fcr + total_afrr_up - max_power,
+                -np.inf,
+                0.0,
+            )
+        )
+        constraints.append(
+            (
+                self.state("charge_power") + total_fcr + total_afrr_down - max_power,
+                -np.inf,
+                0.0,
+            )
+        )
+
+        # SoC LER constraints driven by the committed reserve durations.
+        fcr_t = float(self.reserve_config.get("fcr", {}).get("t_min_hours", 0.0))
+        afrr_up_t = float(self.reserve_config.get("afrr_up", {}).get("t_min_hours", 0.0))
+        afrr_down_t = float(
+            self.reserve_config.get("afrr_down", {}).get("t_min_hours", 0.0)
+        )
+
+        if fcr_t > 0.0 or afrr_down_t > 0.0:
+            constraints.append(
+                (
+                    self.state("soc")
+                    + total_fcr * fcr_t
+                    + total_afrr_down * afrr_down_t
+                    - capacity,
+                    -np.inf,
+                    0.0,
+                )
+            )
+        if fcr_t > 0.0 or afrr_up_t > 0.0:
+            constraints.append(
+                (
+                    -self.state("soc")
+                    + total_fcr * fcr_t
+                    + total_afrr_up * afrr_up_t,
                     -np.inf,
                     0.0,
                 )

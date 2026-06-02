@@ -27,8 +27,19 @@ class TestTranslateScheduling:
 
     def test_csv_has_correct_columns(self, scheduling_input: dict[str, Any]) -> None:
         result = translate_scheduling(scheduling_input)
-        first_line = result.timeseries_csv.splitlines()[0]
-        assert first_line == "time,price,grid_fee_in,grid_fee_out"
+        cols = result.timeseries_csv.splitlines()[0].split(",")
+        # Energy market columns must come first in this order.
+        assert cols[:4] == ["time", "price", "grid_fee_in", "grid_fee_out"]
+        # Reserve columns must all be present (order matters for CSV alignment
+        # with the Modelica input variables).
+        for required in (
+            "fcr_position", "afrr_up_position", "afrr_down_position",
+            "fcr_standby_price", "fcr_price",
+            "afrr_up_standby_price", "afrr_up_price",
+            "afrr_down_standby_price", "afrr_down_price",
+            "fcr_activation_fraction", "afrr_activation_fraction",
+        ):
+            assert required in cols
 
     def test_csv_row_count_includes_endpoint(
         self, scheduling_input: dict[str, Any]

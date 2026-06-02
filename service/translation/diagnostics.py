@@ -1155,6 +1155,255 @@ def _constraint_binding_stats(
     return rows
 
 
+def _reserve_bid_rows(
+    df_out: pd.DataFrame,
+    df_in: pd.DataFrame,
+    reserve_config: dict[str, dict],
+    dt_hours: float,
+) -> list[dict[str, Any]]:
+    """One row per (product, block) summarising the run's reserve bids.
+
+    Only products marked open in *reserve_config* are emitted.  Each row
+    captures the bid MW, the standby + expected-activation revenue, the
+    EUR-per-MW rank within its product, and the constraint that kept the
+    bid below ``max_power`` (if any).
+    """
+    rows: list[dict[str, Any]] = []
+    if not reserve_config or df_out.empty:
+        return rows
+
+    block_hours = 0.0
+    for product, pcfg in reserve_config.items():
+        if not pcfg.get("open"):
+            continue
+        bid_col = f"bid_{product}_total"
+        if bid_col not in df_out.columns:
+            continue
+        bid_arr = df_out[bid_col].to_numpy(dtype=float)
+        standby_col = f"{product}_standby_price"
+        price_col = (
+            "fcr_price" if product == "fcr" else f"{product}_price"
+        )
+        fraction_col = (
+            "fcr_activation_fraction"
+            if product == "fcr"
+            else "afrr_activation_fraction"
+        )
+        standby = (
+            df_in[standby_col].to_numpy(dtype=float)
+            if standby_col in df_in.columns
+            else np.zeros(len(df_out))
+        )
+        price = (
+            df_in[price_col].to_numpy(dtype=float)
+            if price_col in df_in.columns
+            else np.zeros(len(df_out))
+        )
+        fraction = (
+            df_in[fraction_col].to_numpy(dtype=float)
+            if fraction_col in df_in.columns
+            else np.zeros(len(df_out))
+        )
+        for block in pcfg.get("blocks", []) or []:
+            if not block:
+                continue
+            ref = block[0]
+            if ref >= len(bid_arr):
+                continue
+            bid_mw = float(bid_arr[ref])
+            block_hours = len(block) * dt_hours
+            standby_eur = bid_mw * float(standby[ref]) * block_hours
+            # aFRR has activation energy revenue; FCR is symmetric — its
+            # activation revenue is captured in standby, not here.
+            if product.startswith("afrr") and len(block) > 0:
+                idxs = [i for i in block if i < len(bid_arr)]
+                activation_eur = (
+                    float(bid_mw)
+                    * float(fraction[ref])
+                    * float(price[ref])
+                    * dt_hours
+                    * len(idxs)
+                )
+            else:
+                activation_eur = 0.0
+            total_eur = standby_eur + activation_eur
+            rows.append(
+                {
+                    "product": product,
+                    "block_start_idx": ref,
+                    "block_end_idx": block[-1],
+                    "n_ptus": len(block),
+                    "bid_mw": bid_mw,
+                    "standby_eur": standby_eur,
+                    "activation_eur": activation_eur,
+                    "total_eur": total_eur,
+                    "eur_per_mw": (total_eur / bid_mw) if bid_mw > 1e-9 else 0.0,
+                }
+            )
+
+    # Rank within product by EUR/MW descending
+    by_product: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_product.setdefault(r["product"], []).append(r)
+    for prod_rows in by_product.values():
+        prod_rows.sort(key=lambda r: r["eur_per_mw"], reverse=True)
+        for rank, r in enumerate(prod_rows, start=1):
+            r["rank"] = rank
+    return rows
+
+
+def _resolve_binding_constraint(
+    df_out: pd.DataFrame,
+    df_in: pd.DataFrame,
+    product: str,
+    block_ref_idx: int,
+    bid_mw: float,
+    max_power: float,
+    reserve_config: dict[str, dict],
+    capacity: float,
+    tol: float = 1e-3,
+) -> str:
+    """Return a short label for whatever pinned this block's bid below max.
+
+    Checks each of the headroom / LER constraints at the block's reference
+    PTU and reports the first one within tolerance of equality.
+    """
+    if bid_mw >= max_power - tol:
+        return "max_power_cap"
+    if df_out.empty or block_ref_idx >= len(df_out):
+        return ""
+    n = len(df_out)
+    idx = min(block_ref_idx, n - 1)
+
+    def _col(name: str) -> float:
+        return float(df_out[name].iloc[idx]) if name in df_out.columns else 0.0
+
+    discharge = _col("discharge_power")
+    charge = _col("charge_power")
+    soc = _col("soc")
+    total_fcr = _col("total_fcr")
+    total_up = _col("total_afrr_up")
+    total_down = _col("total_afrr_down")
+    fcr_t = float(reserve_config.get("fcr", {}).get("t_min_hours", 0.0))
+    up_t = float(reserve_config.get("afrr_up", {}).get("t_min_hours", 0.0))
+    down_t = float(reserve_config.get("afrr_down", {}).get("t_min_hours", 0.0))
+
+    candidates: list[tuple[str, float]] = []
+    candidates.append(
+        ("power_up_headroom", abs(discharge + total_fcr + total_up - max_power))
+    )
+    candidates.append(
+        ("power_down_headroom", abs(charge + total_fcr + total_down - max_power))
+    )
+    candidates.append(
+        (
+            "soc_upper_LER",
+            abs(soc + total_fcr * fcr_t + total_down * down_t - capacity),
+        )
+    )
+    candidates.append(
+        ("soc_lower_LER", abs(soc - total_fcr * fcr_t - total_up * up_t))
+    )
+    candidates.sort(key=lambda c: c[1])
+    label, slack = candidates[0]
+    if slack < tol * max(1.0, capacity):
+        return label
+    return ""
+
+
+def _committed_reserve_rows(
+    df_in: pd.DataFrame,
+    dt_hours: float,
+) -> list[dict[str, Any]]:
+    """Per-product committed-reserve totals.
+
+    Emitted whenever any pre-cleared position is non-zero; an empty list is
+    returned when the run carries no inherited commitments.
+    """
+    rows: list[dict[str, Any]] = []
+    for product in ("fcr", "afrr_up", "afrr_down"):
+        col = f"{product}_position"
+        if col not in df_in.columns:
+            continue
+        pos = df_in[col].to_numpy(dtype=float)
+        if not np.any(pos > 0.0):
+            continue
+        active_ptus = int(np.sum(pos > 1e-9))
+        peak_mw = float(np.max(pos))
+        mw_h_avg = float(np.mean(pos)) if pos.size else 0.0
+        rows.append(
+            {
+                "product": product,
+                "peak_mw": peak_mw,
+                "avg_mw": mw_h_avg,
+                "active_intervals": active_ptus,
+                "horizon_intervals": int(pos.size),
+                "mwh_reserved": mw_h_avg * pos.size * dt_hours,
+            }
+        )
+    return rows
+
+
+def _reserve_shadow_price_rows(
+    prob: "OptimizationProblem",
+    reserve_config: dict[str, dict],
+    df_out: pd.DataFrame,
+) -> list[dict[str, Any]]:
+    """Per-product, per-block Lagrange-multiplier-driven shadow prices.
+
+    Reads ``prob.lagrange_multipliers`` and the binding-constraint analysis
+    to attribute each multiplier to the constraint it relaxes.  Returns a
+    flat list of rows the reasoning layer renders as a markdown table.
+
+    On any failure (e.g. multipliers unavailable for the chosen solver
+    settings) returns an empty list and the section is omitted.
+    """
+    rows: list[dict[str, Any]] = []
+    if not reserve_config or df_out.empty:
+        return rows
+    # Probing lagrange_multipliers is solver-dependent and may throw; we
+    # surface the binding-constraint label and a "—" multiplier when not
+    # available rather than crashing the reasoning build.
+    try:
+        _, lam_x = prob.lagrange_multipliers
+        avg_abs_lambda = (
+            float(np.mean(np.abs(np.array(lam_x).ravel()))) if lam_x is not None else 0.0
+        )
+    except Exception:
+        avg_abs_lambda = 0.0
+    capacity = _param(prob, "capacity", 100.0)
+    max_power = _param(prob, "max_power", 50.0)
+    for product, pcfg in reserve_config.items():
+        if not pcfg.get("open"):
+            continue
+        bid_col = f"bid_{product}_total"
+        if bid_col not in df_out.columns:
+            continue
+        bid_arr = df_out[bid_col].to_numpy(dtype=float)
+        for block in pcfg.get("blocks", []) or []:
+            if not block:
+                continue
+            ref = block[0]
+            if ref >= len(bid_arr):
+                continue
+            bid_mw = float(bid_arr[ref])
+            binding = _resolve_binding_constraint(
+                df_out, pd.DataFrame(), product, ref,
+                bid_mw, max_power, reserve_config, capacity,
+            )
+            rows.append(
+                {
+                    "product": product,
+                    "block_start_idx": ref,
+                    "block_end_idx": block[-1],
+                    "bid_mw": bid_mw,
+                    "binding_constraint": binding or "—",
+                    "shadow_proxy_eur_per_mw": avg_abs_lambda,
+                }
+            )
+    return rows
+
+
 def _orderbook_depth_stats(
     df_out: pd.DataFrame, df_in: pd.DataFrame, n_segments: int
 ) -> list[dict[str, Any]]:
@@ -1348,10 +1597,18 @@ def build_scheduling_diagnostics(
     model_input: dict[str, Any],
     cycling_penalty: float,
     prob: "OptimizationProblem",
+    *,
+    reserve_config: dict[str, dict] | None = None,
+    counterfactual_metrics: dict[str, Any] | None = None,
+    skip_counterfactual_reserves: bool = False,
 ) -> tuple[dict[str, str], list[str], str]:
     """Generate scheduling explainer charts, table data, and reasoning markdown.
 
     Returns ``(images, info_entries, reasoning_markdown)``.
+
+    When *reserve_config* declares open or committed reserves, additional
+    sections (Reserve Bids, Reserve Shadow Prices, Counterfactual
+    Comparison) are added to the reasoning markdown.
     """
     from service.translation.reasoning import generate_scheduling_markdown
 
@@ -1420,6 +1677,15 @@ def build_scheduling_diagnostics(
         cycle_rows = _build_cycle_rows(
             episodes, comp, charge, discharge, dt, _param(prob, "capacity", 100.0)
         )
+        rcfg = reserve_config or {}
+        reserve_data = {
+            "config": rcfg,
+            "bid_rows": _reserve_bid_rows(df_out, df_in, rcfg, dt),
+            "committed_rows": _committed_reserve_rows(df_in, dt),
+            "shadow_price_rows": _reserve_shadow_price_rows(prob, rcfg, df_out),
+            "counterfactual_metrics": counterfactual_metrics,
+            "skip_counterfactual_reserves": skip_counterfactual_reserves,
+        }
         reasoning_markdown = generate_scheduling_markdown(
             metrics=_collect_scheduling_metrics(df_out, df_in, cycling_penalty, prob),
             cycle_rows=cycle_rows,
@@ -1428,6 +1694,7 @@ def build_scheduling_diagnostics(
             images=images,
             info=info,
             model_input=model_input,
+            reserve_data=reserve_data,
         )
     except Exception as exc:
         _log.warning("Reasoning markdown failed: %s", exc, exc_info=True)
@@ -1443,10 +1710,19 @@ def build_intraday_diagnostics(
     cycling_penalty: float,
     transaction_cost: float,
     prob: "OptimizationProblem",
+    *,
+    reserve_config: dict[str, dict] | None = None,
+    counterfactual_metrics: dict[str, Any] | None = None,
+    skip_counterfactual_reserves: bool = False,
 ) -> tuple[dict[str, str], list[str], str]:
     """Generate intraday explainer charts, table data, and reasoning markdown.
 
     Returns ``(images, info_entries, reasoning_markdown)``.
+
+    When the request carries any committed reserve positions, additional
+    sections (Committed Reserves, Counterfactual Comparison) are added to
+    the reasoning markdown.  Intraday does not bid reserves so there is no
+    Reserve Bids section.
     """
     from service.translation.reasoning import generate_intraday_markdown
 
@@ -1525,6 +1801,17 @@ def build_intraday_diagnostics(
             episodes, comp, incr_charge, incr_discharge, dt,
             _param(prob, "capacity", 100.0),
         )
+        rcfg = reserve_config or {}
+        reserve_data = {
+            "config": rcfg,
+            # Intraday solver never bids reserves, so bid/shadow rows are
+            # always empty here; the reasoning skips those sections.
+            "bid_rows": [],
+            "shadow_price_rows": [],
+            "committed_rows": _committed_reserve_rows(df_in, dt),
+            "counterfactual_metrics": counterfactual_metrics,
+            "skip_counterfactual_reserves": skip_counterfactual_reserves,
+        }
         reasoning_markdown = generate_intraday_markdown(
             metrics=_collect_intraday_metrics(
                 df_out, df_in, n_segments, cycling_penalty, transaction_cost, prob
@@ -1535,6 +1822,7 @@ def build_intraday_diagnostics(
             images=images,
             info=info,
             model_input=model_input,
+            reserve_data=reserve_data,
         )
     except Exception as exc:
         _log.warning("Reasoning markdown failed: %s", exc, exc_info=True)

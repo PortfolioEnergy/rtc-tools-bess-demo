@@ -25,6 +25,18 @@ class TranslationResult:
     n_segments: int
     stored_energy_value: float = 0.0
     info: list[str] = field(default_factory=list)
+    # Reserve config keyed by product ("fcr", "afrr_up", "afrr_down").
+    # Per-product shape: {"open": bool, "t_min_hours": float,
+    #                     "blocks": list[list[int]]}
+    reserve_config: dict[str, dict] = field(default_factory=dict)
+    # Per-product bid-band metadata so the rtc_to_pe layer can reshape the
+    # solver's single bid quantity back into the caller's multi-band format.
+    n_bands_per_product: dict[str, int] = field(default_factory=dict)
+    offer_prices_per_product: dict[str, list[float]] = field(default_factory=dict)
+    # Counterfactual ("no reserves") re-solve toggle.  True = skip the second
+    # solve in the diagnostics layer.  Default False = always run it when
+    # diagnostics are requested (added overhead documented in the markdown).
+    skip_counterfactual_reserves: bool = False
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -91,6 +103,225 @@ def _write_csv(header: list[str], rows: list[list[Any]]) -> str:
     return buf.getvalue()
 
 
+# ── reserve markets (FCR / aFRR) ─────────────────────────────────────
+
+# Product identifiers in the canonical order used everywhere downstream.
+_RESERVE_PRODUCTS: tuple[str, ...] = ("fcr", "afrr_up", "afrr_down")
+
+# PE-wire timeseries names per product.  Two of them — the activation prices
+# and the activation fraction — feed the SoC drift and activation-revenue
+# logic in the solver and are required whenever the matching market is open.
+_RESERVE_TS_NAMES: dict[str, dict[str, str]] = {
+    "fcr": {
+        "position": "fcr_position",
+        "standby_price": "fcr_standby_price",
+        "price": "fcr_price",
+    },
+    "afrr_up": {
+        "position": "afrr_up_position",
+        "standby_price": "afrr_up_standby_price",
+        "price": "afrr_up_price",
+    },
+    "afrr_down": {
+        "position": "afrr_down_position",
+        "standby_price": "afrr_down_standby_price",
+        "price": "afrr_down_price",
+    },
+}
+
+# CSV columns for the per-product reserve timeseries.  These align 1:1 with
+# the ``input Real`` declarations in BESS.mo / BESSIntraday.mo.
+_RESERVE_CSV_COLUMNS: tuple[str, ...] = (
+    "fcr_position", "afrr_up_position", "afrr_down_position",
+    "fcr_standby_price", "fcr_price",
+    "afrr_up_standby_price", "afrr_up_price",
+    "afrr_down_standby_price", "afrr_down_price",
+    "fcr_activation_fraction", "afrr_activation_fraction",
+)
+
+
+def _pad_to(values: list[float], length: int) -> list[float]:
+    """Pad *values* with zeros up to *length* (no-op if already long enough)."""
+    out = [float(v) for v in (values or [])][:length]
+    if len(out) < length:
+        out.extend([0.0] * (length - len(out)))
+    return out
+
+
+def _detect_blocks_from_runs(values: list[float]) -> list[list[int]]:
+    """Group PTU indices into blocks where consecutive standby-price values
+    are identical.
+
+    Example: ``[10, 10, 10, 10, 12, 12, 12, 12]`` (16 PTUs of 4h blocks)
+    becomes ``[[0,1,2,3], [4,5,6,7]]``.
+
+    Zero-valued runs are still grouped (the solver will produce a zero bid
+    there anyway because the standby revenue term is zero).
+    """
+    if not values:
+        return []
+    blocks: list[list[int]] = []
+    current: list[int] = [0]
+    prev = values[0]
+    for i in range(1, len(values)):
+        if values[i] == prev:
+            current.append(i)
+        else:
+            blocks.append(current)
+            current = [i]
+            prev = values[i]
+    blocks.append(current)
+    return blocks
+
+
+def _extract_reserves(
+    model_input: dict[str, Any],
+    n_intervals: int,
+    info: list[str],
+) -> tuple[dict[str, dict], dict[str, list[float]], dict[str, int],
+           dict[str, list[float]]]:
+    """Pull all reserve-market state out of the PE request.
+
+    Returns ``(reserve_config, reserve_columns, n_bands_per_product,
+    offer_prices_per_product)``:
+
+    - ``reserve_config`` — per-product ``{"open": bool, "t_min_hours": float,
+      "blocks": list[list[int]]}``; consumed by the solver class to add LER
+      and block-equality constraints.
+    - ``reserve_columns`` — column-name -> per-PTU values for every
+      Modelica ``input Real`` reserve variable, defaulted to zero when the
+      caller omitted a timeseries.
+    - ``n_bands_per_product`` — used by rtc_to_pe to reshape the solver's
+      scalar bid into the caller's multi-band wire format.
+    - ``offer_prices_per_product`` — ditto, holds the offer-price list per
+      product so the reshape can fill cheapest-band-first.
+
+    Raises ``ValueError`` (mapped to HTTP 422 in the route) when the caller
+    opened an aFRR market without supplying the matching activation-fraction
+    timeseries.  FCR has the same requirement for its activation cycling
+    cost.
+    """
+    reserve_config: dict[str, dict] = {}
+    reserve_columns: dict[str, list[float]] = {}
+    n_bands_per_product: dict[str, int] = {}
+    offer_prices_per_product: dict[str, list[float]] = {}
+
+    # Default every reserve column to zeros so the CSV always has the
+    # right shape — solvers never see undefined columns.
+    for col in _RESERVE_CSV_COLUMNS:
+        reserve_columns[col] = [0.0] * n_intervals
+
+    markets_by_name = {
+        m.get("name"): m
+        for m in model_input.get("markets", [])
+        if m.get("name") in _RESERVE_PRODUCTS
+    }
+
+    # Always populate committed-position timeseries (they exist regardless
+    # of which markets are open this run).
+    for product in _RESERVE_PRODUCTS:
+        ts_name = _RESERVE_TS_NAMES[product]["position"]
+        ts = _find_timeseries(model_input, ts_name)
+        if ts and ts.get("values"):
+            reserve_columns[ts_name] = _pad_to(ts["values"], n_intervals)
+            if _has_nonzero(ts["values"]):
+                info.append(
+                    f"applied: committed '{ts_name}' "
+                    f"({len(ts['values'])} values) "
+                    f"— tightens LER and power headroom"
+                )
+
+    # Reserve price + activation-fraction timeseries.  Required for open
+    # markets, optional otherwise (defaulted to zero so closed markets
+    # contribute nothing to the objective).
+    fcr_activation_fraction_ts = _find_timeseries(model_input, "fcr_activation_fraction")
+    afrr_activation_fraction_ts = _find_timeseries(
+        model_input, "afrr_activation_fraction"
+    )
+    if fcr_activation_fraction_ts and fcr_activation_fraction_ts.get("values"):
+        reserve_columns["fcr_activation_fraction"] = _pad_to(
+            fcr_activation_fraction_ts["values"], n_intervals
+        )
+    if afrr_activation_fraction_ts and afrr_activation_fraction_ts.get("values"):
+        reserve_columns["afrr_activation_fraction"] = _pad_to(
+            afrr_activation_fraction_ts["values"], n_intervals
+        )
+
+    for product in _RESERVE_PRODUCTS:
+        for ts_key in ("standby_price", "price"):
+            ts_name = _RESERVE_TS_NAMES[product][ts_key]
+            ts = _find_timeseries(model_input, ts_name)
+            if ts and ts.get("values"):
+                reserve_columns[ts_name] = _pad_to(ts["values"], n_intervals)
+
+    # Walk every open market and stamp its config, validate required series,
+    # capture multi-band metadata for the output-reshape layer.
+    for product in _RESERVE_PRODUCTS:
+        market = markets_by_name.get(product)
+        if market is None:
+            reserve_config[product] = {
+                "open": False, "t_min_hours": 0.0, "blocks": [],
+            }
+            continue
+
+        # LER duration.  Accept either ``activation_duration`` (seconds, the
+        # canonical poc-backtesting field) or a legacy ``t_min_minutes``.
+        if "activation_duration" in market:
+            t_min_hours = float(market["activation_duration"]) / 3600.0
+        elif "t_min_minutes" in market:
+            t_min_hours = float(market["t_min_minutes"]) / 60.0
+        else:
+            t_min_hours = 0.25  # 15-min default (ACER-aligned)
+            info.append(
+                f"approximation: market '{product}' missing "
+                "'activation_duration' / 't_min_minutes' — "
+                "defaulting LER duration to 15 minutes"
+            )
+
+        # Required activation-fraction timeseries for any open product.
+        fraction_name = (
+            "fcr_activation_fraction"
+            if product == "fcr"
+            else "afrr_activation_fraction"
+        )
+        fraction_ts = _find_timeseries(model_input, fraction_name)
+        if fraction_ts is None or not fraction_ts.get("values"):
+            raise ValueError(
+                f"Open market '{product}' requires timeseries "
+                f"'{fraction_name}' — none supplied"
+            )
+
+        # Bid-block detection from runs of identical standby-price values.
+        standby = reserve_columns[_RESERVE_TS_NAMES[product]["standby_price"]]
+        blocks = _detect_blocks_from_runs(standby)
+
+        reserve_config[product] = {
+            "open": True,
+            "t_min_hours": t_min_hours,
+            "blocks": blocks,
+        }
+
+        n_bands = int(market.get("n_price_bands", 1) or 1)
+        n_bands_per_product[product] = n_bands
+        offer_prices = market.get("offer_prices") or []
+        offer_prices_per_product[product] = [float(p) for p in offer_prices]
+
+        if market.get("service_activation_constraints"):
+            info.append(
+                f"approximation: market '{product}' set "
+                "service_activation_constraints=true — "
+                "downgraded to expected-value modelling for v1"
+            )
+
+        info.append(
+            f"applied: market '{product}' open — bid as decision variable, "
+            f"t_min={t_min_hours * 60:.0f} min, "
+            f"{len(blocks)} block(s), n_price_bands={n_bands}"
+        )
+
+    return reserve_config, reserve_columns, n_bands_per_product, offer_prices_per_product
+
+
 # ── scheduling ───────────────────────────────────────────────────────
 
 
@@ -132,6 +363,9 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
     cost_per_cycle = _find_parameter(model_input, "cost_per_cycle", default=2.0)
     stored_energy_value = _find_parameter(model_input, "stored_energy_value")
     epsilon = _find_parameter(model_input, "epsilon")
+    skip_counterfactual = bool(
+        _find_parameter(model_input, "skip_counterfactual_reserves", default=0.0)
+    )
 
     max_power: float | None = None
     if max_charge is not None and max_discharge is not None:
@@ -168,6 +402,9 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
     for market in model_input.get("markets", []):
         mname = market.get("name", "unknown")
         mtype = market.get("type", "unknown")
+        if mname in _RESERVE_PRODUCTS:
+            # Reserve markets handled by _extract_reserves below
+            continue
         if mtype == "imbalance":
             info.append(
                 f"ignored_input: market config '{mname}' (type={mtype}) "
@@ -189,6 +426,15 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
                     f"keys {ignored_keys} — not used by local solver"
                 )
 
+    # ── reserves ──
+    n_intervals = len(interval_start)
+    (
+        reserve_config,
+        reserve_columns,
+        n_bands_per_product,
+        offer_prices_per_product,
+    ) = _extract_reserves(model_input, n_intervals, info)
+
     # ── build CSVs ──
 
     # timeseries_import.csv — time,price
@@ -208,7 +454,6 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
         padded_prices.append(padded_prices[-1])
 
     # Pad grid fees to match times length, defaulting to 0.0
-    n_intervals = len(interval_start)
 
     padded_fee_in = (
         list(grid_fee_in_values) if grid_fee_in_values else [0.0] * n_intervals
@@ -235,23 +480,33 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
             f"— subtracted from discharging revenue in objective"
         )
 
-    # Prepend dummy row — price=0 and fees=0 so the optimizer earns nothing there
+    # Append endpoint rows to reserve columns (repeat last value).
+    for col in _RESERVE_CSV_COLUMNS:
+        vals = reserve_columns[col]
+        vals.append(vals[-1] if vals else 0.0)
+
+    # Prepend dummy row — price=0, fees=0, all reserves=0 so the optimizer
+    # earns nothing and is constrained to nothing on the dummy timestep.
     if interval_start:
         times.insert(0, _prepend_dummy_time(interval_start))
         padded_prices.insert(0, 0.0)
         padded_fee_in.insert(0, 0.0)
         padded_fee_out.insert(0, 0.0)
+        for col in _RESERVE_CSV_COLUMNS:
+            reserve_columns[col].insert(0, 0.0)
 
+    header = ["time", "price", "grid_fee_in", "grid_fee_out", *_RESERVE_CSV_COLUMNS]
     rows = [
         [
             times[i],
             padded_prices[i] if i < len(padded_prices) else 0.0,
             padded_fee_in[i],
             padded_fee_out[i],
+            *[reserve_columns[col][i] for col in _RESERVE_CSV_COLUMNS],
         ]
         for i in range(len(times))
     ]
-    timeseries_csv = _write_csv(["time", "price", "grid_fee_in", "grid_fee_out"], rows)
+    timeseries_csv = _write_csv(header, rows)
 
     # initial_state.csv
     initial_state_csv = _write_csv(["soc"], [[initial_soc]])
@@ -294,6 +549,10 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
         n_segments=0,
         stored_energy_value=sev,
         info=info,
+        reserve_config=reserve_config,
+        n_bands_per_product=n_bands_per_product,
+        offer_prices_per_product=offer_prices_per_product,
+        skip_counterfactual_reserves=skip_counterfactual,
     )
 
 
@@ -360,6 +619,9 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
     cost_per_cycle = _find_parameter(model_input, "cost_per_cycle", default=2.0)
     stored_energy_value = _find_parameter(model_input, "stored_energy_value")
     epsilon = _find_parameter(model_input, "epsilon")
+    skip_counterfactual = bool(
+        _find_parameter(model_input, "skip_counterfactual_reserves", default=0.0)
+    )
 
     max_power: float | None = None
     if max_charge is not None and max_discharge is not None:
@@ -396,10 +658,37 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
     for market in model_input.get("markets", []):
         mtype = market.get("type", "unknown")
         mname = market.get("name", "unknown")
+        if mname in _RESERVE_PRODUCTS:
+            # Reserve markets handled by _extract_reserves below.  The intraday
+            # solver never bids reserves but still consumes their LER and
+            # headroom impact via the committed_<p> timeseries.
+            continue
         if mtype == "imbalance":
             info.append(
                 f"ignored_input: market config '{mname}' (type={mtype}) "
                 f"— imbalance market not modeled"
+            )
+
+    # ── reserves ──
+    # Extract reserve config before CSV building so the columns can be
+    # appended to the row layout below.
+    n_intervals_for_reserves = len(interval_start)
+    (
+        reserve_config,
+        reserve_columns,
+        n_bands_per_product,
+        offer_prices_per_product,
+    ) = _extract_reserves(model_input, n_intervals_for_reserves, info)
+
+    # Intraday never *bids* reserves: any market entry the caller included
+    # is treated as committed-only, so flip ``open`` to False here.  The
+    # solver class also pins bid totals to 0 as belt-and-braces.
+    for product in _RESERVE_PRODUCTS:
+        if reserve_config.get(product, {}).get("open"):
+            reserve_config[product]["open"] = False
+            info.append(
+                f"approximation: intraday solver ignores '{product}' bid "
+                "decision variables — only the committed position is honoured"
             )
 
     # ── build CSVs ──
@@ -493,6 +782,11 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
             values.append(values[-1])
             orderbook_columns[csv_name] = values
 
+    # Append endpoint rows for reserve columns (repeat last value).
+    for col in _RESERVE_CSV_COLUMNS:
+        vals = reserve_columns[col]
+        vals.append(vals[-1] if vals else 0.0)
+
     # Prepend dummy row — zero volumes so no trading is possible there
     if interval_start:
         times.insert(0, _prepend_dummy_time(interval_start))
@@ -502,6 +796,8 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
         padded_fee_out.insert(0, 0.0)
         for csv_name, values in orderbook_columns.items():
             values.insert(0, 0.0)
+        for col in _RESERVE_CSV_COLUMNS:
+            reserve_columns[col].insert(0, 0.0)
 
     # Build header and rows
     header = [
@@ -520,6 +816,7 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
                 f"ask_volumes[{seg}]",
             ]
         )
+    header.extend(_RESERVE_CSV_COLUMNS)
 
     rows: list[list[Any]] = []
     for i in range(len(times)):
@@ -535,6 +832,8 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
             row.append(orderbook_columns[f"ask_prices[{seg}]"][i])
             row.append(orderbook_columns[f"bid_volumes[{seg}]"][i])
             row.append(orderbook_columns[f"ask_volumes[{seg}]"][i])
+        for col in _RESERVE_CSV_COLUMNS:
+            row.append(reserve_columns[col][i])
         rows.append(row)
 
     timeseries_csv = _write_csv(header, rows)
@@ -580,4 +879,8 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
         n_segments=n_segments,
         stored_energy_value=sev,
         info=info,
+        reserve_config=reserve_config,
+        n_bands_per_product=n_bands_per_product,
+        offer_prices_per_product=offer_prices_per_product,
+        skip_counterfactual_reserves=skip_counterfactual,
     )

@@ -25,8 +25,9 @@ class ConfigurableBESSIntraday(BESSIntraday):
 
     Battery parameters (``capacity``, ``max_power``, ``efficiency``,
     ``n_orderbook_entries``) are overridden via ``parameters.csv``.
-    ``cycling_penalty_factor``, ``transaction_cost``, and
-    ``stored_energy_value`` need Python-level overrides.
+    ``cycling_penalty_factor``, ``transaction_cost``,
+    ``stored_energy_value`` and the reserve-market config need Python-level
+    overrides.
 
     The ``objective()`` override with terminal SoC valuation lives in the
     base ``BESSIntraday`` class.  This subclass only needs to inject the
@@ -36,12 +37,17 @@ class ConfigurableBESSIntraday(BESSIntraday):
     _cycling_penalty: float = 2.0
     _transaction_cost: float = 0.05
     _stored_energy_value: float = 0.0
+    _reserve_config: dict | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.cycling_penalty_factor = self.__class__._cycling_penalty
         self.transaction_cost = self.__class__._transaction_cost
         self.stored_energy_value = self.__class__._stored_energy_value
+        if self.__class__._reserve_config is not None:
+            self.reserve_config = {
+                k: dict(v) for k, v in self.__class__._reserve_config.items()
+            }
 
     def post(self):
         # Skip the demo's print statements — we read CSV output directly
