@@ -54,19 +54,44 @@ _SINGLE_BAND_NAMES: dict[str, str] = {
 }
 
 
+def _shape_by_grid(
+    values: list[float],
+    grid: dict | None,
+) -> dict[str, Any]:
+    """Build the wire payload for one member.
+
+    When *grid* is ``None`` the legacy single-key ``{"values": [...]}`` shape
+    is preserved (caller did not declare a per-timeseries grid on the input
+    that drives this member).  When *grid* is present the values are
+    collapsed onto its blocks — one entry per block taken from the first
+    PTU inside the block — and the block-spanning ``interval_start`` /
+    ``interval_end`` arrays are attached.
+    """
+    if grid is None:
+        return {"values": values}
+    blocks: list[list[int]] = grid["blocks"]
+    block_values = [values[b[0]] for b in blocks]
+    return {
+        "values": block_values,
+        "interval_start": list(grid["interval_start"]),
+        "interval_end": list(grid["interval_end"]),
+    }
+
+
 def _emit_reserve_members(
     members: dict[str, Any],
     df: pd.DataFrame,
     info: list[str],
     n_bands_per_product: dict[str, int],
     offer_prices_per_product: dict[str, list[float]],
+    market_grids: dict[str, dict],
 ) -> None:
     """Append reserve-bid output members to *members*.
 
     Always emits:
 
-    - ``bid_<p>_total`` for each product (scalar MW per PTU)
-    - ``<p>_position`` echoing the committed input (for caller-side accounting)
+    - ``bid_<p>_total`` for each product (MW per output bucket)
+    - ``<p>_position`` echoing the committed input
     - ``total_<p>`` (committed + bid) for headroom-check transparency
 
     For each product whose ``n_bands_per_product`` is 1 (or missing), emits
@@ -74,6 +99,12 @@ def _emit_reserve_members(
     For multi-band products, emits ``<p>_capacity_deltas[k]`` for k=1..N
     with the entire bid allocated to band 1 (cheapest offer price) and the
     rest zero — the solver's deterministic bid clears at band 1 anyway.
+
+    When the caller supplied a per-timeseries ``interval_start`` /
+    ``interval_end`` grid for a reserve product, every output member for
+    that product is collapsed onto that grid (one value per input block)
+    and carries the same ``interval_start`` / ``interval_end`` arrays.
+    Products whose inputs were at PTU resolution keep the legacy shape.
     """
     n = len(df)
     for product in ("fcr", "afrr_up", "afrr_down"):
@@ -91,13 +122,17 @@ def _emit_reserve_members(
             float(t) - float(b) for t, b in zip(total_values, bid_values)
         ]
 
-        members[f"bid_{product}_total"] = {"values": bid_values}
-        members[f"total_{product}"]     = {"values": total_values}
-        members[f"{product}_position"]  = {"values": position_values}
+        grid = market_grids.get(product)
+        bid_payload = _shape_by_grid(bid_values, grid)
+        members[f"bid_{product}_total"] = bid_payload
+        members[f"total_{product}"] = _shape_by_grid(total_values, grid)
+        members[f"{product}_position"] = _shape_by_grid(position_values, grid)
 
         n_bands = max(1, int(n_bands_per_product.get(product, 1)))
         if n_bands == 1:
-            members[_SINGLE_BAND_NAMES[product]] = {"values": bid_values}
+            # Single-band wire shape aliases bid_<p>_total exactly, including
+            # any block grid the caller declared on the input.
+            members[_SINGLE_BAND_NAMES[product]] = dict(bid_payload)
             continue
 
         # Multi-band wire-shape compatibility: allocate the full bid to the
@@ -106,9 +141,16 @@ def _emit_reserve_members(
         # When a future iteration models price uncertainty, the spread
         # logic moves here.
         prices = offer_prices_per_product.get(product) or []
-        members[f"{product}_capacity_deltas[1]"] = {"values": list(bid_values)}
+        zeros = [0.0] * len(bid_payload["values"])
+        zero_payload: dict[str, Any] = {"values": zeros}
+        if grid is not None:
+            zero_payload["interval_start"] = list(grid["interval_start"])
+            zero_payload["interval_end"] = list(grid["interval_end"])
+        members[f"{product}_capacity_deltas[1]"] = dict(bid_payload)
         for k in range(2, n_bands + 1):
-            members[f"{product}_capacity_deltas[{k}]"] = {"values": [0.0] * n}
+            members[f"{product}_capacity_deltas[{k}]"] = {
+                key: list(value) for key, value in zero_payload.items()
+            }
         info.append(
             f"approximation: multi-band bid for '{product}' "
             f"(n_price_bands={n_bands}) collapsed to band 1 "
@@ -130,6 +172,7 @@ def translate_scheduling_result(
     n_bands_per_product: dict[str, int] | None = None,
     offer_prices_per_product: dict[str, list[float]] | None = None,
     reserve_config: dict[str, dict] | None = None,
+    market_grids: dict[str, dict] | None = None,
     counterfactual_metrics: dict[str, Any] | None = None,
     skip_counterfactual_reserves: bool = False,
 ) -> tuple[dict[str, Any], str]:
@@ -157,9 +200,11 @@ def translate_scheduling_result(
     # Use the original interval_start timestamps for SOC times
     soc_times = list(interval_start)
 
+    grids = market_grids or {}
+    da_grid = grids.get("day_ahead")
     members: dict[str, Any] = {
-        "day_ahead_power_in": {"values": _safe_list(df["charge_power"])},
-        "day_ahead_power_out": {"values": _safe_list(df["discharge_power"])},
+        "day_ahead_power_in": _shape_by_grid(_safe_list(df["charge_power"]), da_grid),
+        "day_ahead_power_out": _shape_by_grid(_safe_list(df["discharge_power"]), da_grid),
         "state_of_charge": {
             "values": _safe_list(df["soc"]),
             "times": soc_times,
@@ -173,6 +218,7 @@ def translate_scheduling_result(
         info,
         n_bands_per_product or {},
         offer_prices_per_product or {},
+        grids,
     )
 
     # Document outputs the PE API returns but we don't
@@ -226,6 +272,7 @@ def translate_intraday_result(
     n_bands_per_product: dict[str, int] | None = None,
     offer_prices_per_product: dict[str, list[float]] | None = None,
     reserve_config: dict[str, dict] | None = None,
+    market_grids: dict[str, dict] | None = None,
     counterfactual_metrics: dict[str, Any] | None = None,
     skip_counterfactual_reserves: bool = False,
 ) -> tuple[dict[str, Any], str]:
@@ -297,6 +344,7 @@ def translate_intraday_result(
         info,
         n_bands_per_product or {},
         offer_prices_per_product or {},
+        market_grids or {},
     )
 
     reasoning_markdown = ""

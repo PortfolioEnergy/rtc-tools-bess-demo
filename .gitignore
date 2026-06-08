@@ -3,3 +3,6 @@ __pycache__/
 temp/
 # Stray file created by accidental `2>nul` redirects in PowerShell
 nul
+.ai
+*.code-workspace
+.vscode/

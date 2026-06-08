@@ -37,6 +37,13 @@ class TranslationResult:
     # solve in the diagnostics layer.  Default False = always run it when
     # diagnostics are requested (added overhead documented in the markdown).
     skip_counterfactual_reserves: bool = False
+    # Per-market output grid keyed by market identifier ("fcr", "afrr_up",
+    # "afrr_down", "day_ahead").  Populated only when the matching input
+    # timeseries declared its own ``interval_start`` / ``interval_end``.
+    # Each entry carries ``interval_start``, ``interval_end`` and the
+    # ``blocks`` PTU-index partition; rtc_to_pe collapses output members
+    # onto this grid by taking the first PTU value of each block.
+    market_grids: dict[str, dict] = field(default_factory=dict)
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -148,63 +155,152 @@ def _pad_to(values: list[float], length: int) -> list[float]:
     return out
 
 
-def _detect_blocks_from_runs(values: list[float]) -> list[list[int]]:
-    """Group PTU indices into blocks where consecutive standby-price values
-    are identical.
+def _parse_iso_utc(iso: str) -> datetime:
+    """Parse an ISO-8601 timestamp into a tz-aware UTC ``datetime``."""
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
 
-    Example: ``[10, 10, 10, 10, 12, 12, 12, 12]`` (16 PTUs of 4h blocks)
-    becomes ``[[0,1,2,3], [4,5,6,7]]``.
 
-    Zero-valued runs are still grouped (the solver will produce a zero bid
-    there anyway because the standby revenue term is zero).
+def _ptu_block_membership(
+    ts_starts: list[str],
+    ts_ends: list[str],
+    ptu_starts_dt: list[datetime],
+    ts_name: str,
+) -> list[int]:
+    """For each PTU, return the index of the input block that contains it.
+
+    Raises ``ValueError`` (→ HTTP 422) when the input grid is malformed or
+    fails to cover every PTU exactly once.  Block coverage uses
+    ``[start, end)`` semantics so contiguous blocks share boundaries without
+    overlap.
     """
+    if len(ts_starts) != len(ts_ends):
+        raise ValueError(
+            f"timeseries '{ts_name}': interval_start ({len(ts_starts)}) and "
+            f"interval_end ({len(ts_ends)}) lengths differ"
+        )
+    if not ts_starts:
+        raise ValueError(
+            f"timeseries '{ts_name}': interval_start/interval_end are empty "
+            f"but a grid was declared"
+        )
+    starts_dt = [_parse_iso_utc(t) for t in ts_starts]
+    ends_dt = [_parse_iso_utc(t) for t in ts_ends]
+    membership: list[int] = []
+    for ptu_idx, ptu_start in enumerate(ptu_starts_dt):
+        block = next(
+            (
+                k
+                for k, (s, e) in enumerate(zip(starts_dt, ends_dt))
+                if s <= ptu_start < e
+            ),
+            None,
+        )
+        if block is None:
+            raise ValueError(
+                f"timeseries '{ts_name}': PTU {ptu_idx} "
+                f"({ptu_start.isoformat()}) is not covered by any input block"
+            )
+        membership.append(block)
+    return membership
+
+
+def _expand_timeseries_to_ptu(
+    ts: dict[str, Any] | None,
+    ptu_starts_dt: list[datetime],
+    ts_name: str,
+) -> tuple[list[float] | None, dict[str, list[str]] | None]:
+    """Expand a timeseries onto the PTU grid using its own grid (when present).
+
+    Returns ``(values_per_ptu, grid)``:
+
+    - ``values_per_ptu`` carries one value per PTU; ``None`` when ``ts`` is
+      absent or empty.
+    - ``grid`` echoes the input's ``interval_start`` / ``interval_end`` when
+      it declared its own; ``None`` otherwise (the input was already at PTU
+      resolution and the top-level grid governs).
+    """
+    if ts is None:
+        return None, None
+    values = ts.get("values")
     if not values:
-        return []
-    blocks: list[list[int]] = []
-    current: list[int] = [0]
-    prev = values[0]
-    for i in range(1, len(values)):
-        if values[i] == prev:
-            current.append(i)
-        else:
-            blocks.append(current)
-            current = [i]
-            prev = values[i]
-    blocks.append(current)
-    return blocks
+        return None, None
+    starts_in = ts.get("interval_start") or []
+    ends_in = ts.get("interval_end") or []
+    if not starts_in and not ends_in:
+        return [float(v) for v in values], None
+    if len(values) != len(starts_in):
+        raise ValueError(
+            f"timeseries '{ts_name}': values ({len(values)}) and "
+            f"interval_start ({len(starts_in)}) lengths differ"
+        )
+    membership = _ptu_block_membership(starts_in, ends_in, ptu_starts_dt, ts_name)
+    return (
+        [float(values[k]) for k in membership],
+        {"interval_start": list(starts_in), "interval_end": list(ends_in)},
+    )
+
+
+def _blocks_from_grid(
+    grid_starts: list[str],
+    grid_ends: list[str],
+    ptu_starts_dt: list[datetime],
+    ts_name: str,
+) -> list[list[int]]:
+    """Return PTU indices grouped by their containing input block."""
+    membership = _ptu_block_membership(grid_starts, grid_ends, ptu_starts_dt, ts_name)
+    bucket: dict[int, list[int]] = {}
+    for ptu_idx, block in enumerate(membership):
+        bucket.setdefault(block, []).append(ptu_idx)
+    return [bucket[k] for k in sorted(bucket)]
 
 
 def _extract_reserves(
     model_input: dict[str, Any],
-    n_intervals: int,
+    ptu_starts_dt: list[datetime],
     info: list[str],
-) -> tuple[dict[str, dict], dict[str, list[float]], dict[str, int],
-           dict[str, list[float]]]:
+) -> tuple[
+    dict[str, dict],
+    dict[str, list[float]],
+    dict[str, int],
+    dict[str, list[float]],
+    dict[str, dict],
+]:
     """Pull all reserve-market state out of the PE request.
 
     Returns ``(reserve_config, reserve_columns, n_bands_per_product,
-    offer_prices_per_product)``:
+    offer_prices_per_product, market_grids)``:
 
     - ``reserve_config`` — per-product ``{"open": bool, "t_min_hours": float,
       "blocks": list[list[int]]}``; consumed by the solver class to add LER
-      and block-equality constraints.
+      and block-equality constraints.  ``blocks`` is empty when the caller
+      passed reserve inputs at PTU resolution (no per-timeseries
+      ``interval_start`` / ``interval_end``).
     - ``reserve_columns`` — column-name -> per-PTU values for every
       Modelica ``input Real`` reserve variable, defaulted to zero when the
-      caller omitted a timeseries.
+      caller omitted a timeseries.  Block-shaped inputs are pre-expanded
+      onto the PTU grid here so the solver always sees PTU-resolution data.
     - ``n_bands_per_product`` — used by rtc_to_pe to reshape the solver's
       scalar bid into the caller's multi-band wire format.
     - ``offer_prices_per_product`` — ditto, holds the offer-price list per
       product so the reshape can fill cheapest-band-first.
+    - ``market_grids`` — per-product ``{"interval_start", "interval_end"}``
+      grids derived from the explicit input timeseries grids.  Used by the
+      output translation to echo the same grid back to the caller.
+      ``standby_price`` wins when several reserve inputs for the same
+      product declare a grid (the bid block structure follows the standby
+      revenue stream).
 
     Raises ``ValueError`` (mapped to HTTP 422 in the route) when the caller
     opened an aFRR market without supplying the matching activation-fraction
     timeseries.  FCR has the same requirement for its activation cycling
     cost.
     """
+    n_intervals = len(ptu_starts_dt)
     reserve_config: dict[str, dict] = {}
     reserve_columns: dict[str, list[float]] = {}
     n_bands_per_product: dict[str, int] = {}
     offer_prices_per_product: dict[str, list[float]] = {}
+    market_grids: dict[str, dict] = {}
 
     # Default every reserve column to zeros so the CSV always has the
     # right shape — solvers never see undefined columns.
@@ -217,42 +313,43 @@ def _extract_reserves(
         if m.get("name") in _RESERVE_PRODUCTS
     }
 
-    # Always populate committed-position timeseries (they exist regardless
-    # of which markets are open this run).
-    for product in _RESERVE_PRODUCTS:
-        ts_name = _RESERVE_TS_NAMES[product]["position"]
+    # Per-product cache of the grid attached to each input timeseries; the
+    # priority order ``standby_price > price > position`` picks the product
+    # grid below.
+    product_input_grids: dict[str, dict[str, dict[str, list[str]] | None]] = {
+        p: {} for p in _RESERVE_PRODUCTS
+    }
+
+    def _ingest(product: str, ts_key: str, ts_name: str) -> None:
         ts = _find_timeseries(model_input, ts_name)
-        if ts and ts.get("values"):
-            reserve_columns[ts_name] = _pad_to(ts["values"], n_intervals)
-            if _has_nonzero(ts["values"]):
-                info.append(
-                    f"applied: committed '{ts_name}' "
-                    f"({len(ts['values'])} values) "
-                    f"— tightens LER and power headroom"
-                )
-
-    # Reserve price + activation-fraction timeseries.  Required for open
-    # markets, optional otherwise (defaulted to zero so closed markets
-    # contribute nothing to the objective).
-    fcr_activation_fraction_ts = _find_timeseries(model_input, "fcr_activation_fraction")
-    afrr_activation_fraction_ts = _find_timeseries(
-        model_input, "afrr_activation_fraction"
-    )
-    if fcr_activation_fraction_ts and fcr_activation_fraction_ts.get("values"):
-        reserve_columns["fcr_activation_fraction"] = _pad_to(
-            fcr_activation_fraction_ts["values"], n_intervals
-        )
-    if afrr_activation_fraction_ts and afrr_activation_fraction_ts.get("values"):
-        reserve_columns["afrr_activation_fraction"] = _pad_to(
-            afrr_activation_fraction_ts["values"], n_intervals
-        )
+        values, grid = _expand_timeseries_to_ptu(ts, ptu_starts_dt, ts_name)
+        if values is not None:
+            reserve_columns[ts_name] = _pad_to(values, n_intervals)
+        product_input_grids[product][ts_key] = grid
+        if (
+            ts_key == "position"
+            and values is not None
+            and _has_nonzero(values)
+        ):
+            info.append(
+                f"applied: committed '{ts_name}' ({len(values)} values) "
+                f"— tightens LER and power headroom"
+            )
 
     for product in _RESERVE_PRODUCTS:
-        for ts_key in ("standby_price", "price"):
-            ts_name = _RESERVE_TS_NAMES[product][ts_key]
-            ts = _find_timeseries(model_input, ts_name)
-            if ts and ts.get("values"):
-                reserve_columns[ts_name] = _pad_to(ts["values"], n_intervals)
+        _ingest(product, "position", _RESERVE_TS_NAMES[product]["position"])
+        _ingest(product, "standby_price", _RESERVE_TS_NAMES[product]["standby_price"])
+        _ingest(product, "price", _RESERVE_TS_NAMES[product]["price"])
+
+    # Activation-fraction series (shared across FCR / aFRR products).  These
+    # may carry their own grid too; expand consistently.
+    for fraction_name in ("fcr_activation_fraction", "afrr_activation_fraction"):
+        fraction_ts = _find_timeseries(model_input, fraction_name)
+        fraction_values, _ = _expand_timeseries_to_ptu(
+            fraction_ts, ptu_starts_dt, fraction_name
+        )
+        if fraction_values is not None:
+            reserve_columns[fraction_name] = _pad_to(fraction_values, n_intervals)
 
     # Walk every open market and stamp its config, validate required series,
     # capture multi-band metadata for the output-reshape layer.
@@ -291,9 +388,21 @@ def _extract_reserves(
                 f"'{fraction_name}' — none supplied"
             )
 
-        # Bid-block detection from runs of identical standby-price values.
-        standby = reserve_columns[_RESERVE_TS_NAMES[product]["standby_price"]]
-        blocks = _detect_blocks_from_runs(standby)
+        # Bid-block structure is the standby_price grid (it drives the
+        # standby revenue stream).  ``price`` and ``position`` grids serve
+        # as fallbacks for callers that didn't price-bid on a block.
+        grids = product_input_grids[product]
+        product_grid = grids.get("standby_price") or grids.get("price") or grids.get("position")
+        if product_grid is not None:
+            blocks = _blocks_from_grid(
+                product_grid["interval_start"],
+                product_grid["interval_end"],
+                ptu_starts_dt,
+                _RESERVE_TS_NAMES[product]["standby_price"],
+            )
+            market_grids[product] = {**product_grid, "blocks": blocks}
+        else:
+            blocks = []
 
         reserve_config[product] = {
             "open": True,
@@ -319,7 +428,13 @@ def _extract_reserves(
             f"{len(blocks)} block(s), n_price_bands={n_bands}"
         )
 
-    return reserve_config, reserve_columns, n_bands_per_product, offer_prices_per_product
+    return (
+        reserve_config,
+        reserve_columns,
+        n_bands_per_product,
+        offer_prices_per_product,
+        market_grids,
+    )
 
 
 # ── scheduling ───────────────────────────────────────────────────────
@@ -331,16 +446,39 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
 
     interval_start: list[str] = model_input.get("interval_start", [])
     interval_end: list[str] = model_input.get("interval_end", [])
+    ptu_starts_dt = [_parse_iso_utc(t) for t in interval_start]
+
+    market_grids: dict[str, dict] = {}
 
     # ── timeseries ──
+    # day_ahead_price drives the day-ahead output grid; its native grid (if
+    # the caller supplied one) is echoed onto day_ahead_power_in / _out.
     price_ts = _find_timeseries(model_input, "day_ahead_price")
-    prices = price_ts["values"] if price_ts else []
+    prices, da_grid = _expand_timeseries_to_ptu(
+        price_ts, ptu_starts_dt, "day_ahead_price"
+    )
+    if prices is None:
+        prices = []
+    if da_grid is not None:
+        da_blocks = _blocks_from_grid(
+            da_grid["interval_start"],
+            da_grid["interval_end"],
+            ptu_starts_dt,
+            "day_ahead_price",
+        )
+        market_grids["day_ahead"] = {**da_grid, "blocks": da_blocks}
 
     grid_fee_in_ts = _find_timeseries(model_input, "grid_fee_in")
-    grid_fee_in_values = grid_fee_in_ts["values"] if grid_fee_in_ts else []
+    grid_fee_in_values, _ = _expand_timeseries_to_ptu(
+        grid_fee_in_ts, ptu_starts_dt, "grid_fee_in"
+    )
+    grid_fee_in_values = grid_fee_in_values or []
 
     grid_fee_out_ts = _find_timeseries(model_input, "grid_fee_out")
-    grid_fee_out_values = grid_fee_out_ts["values"] if grid_fee_out_ts else []
+    grid_fee_out_values, _ = _expand_timeseries_to_ptu(
+        grid_fee_out_ts, ptu_starts_dt, "grid_fee_out"
+    )
+    grid_fee_out_values = grid_fee_out_values or []
 
     soc_ts = _find_timeseries(model_input, "state_of_charge")
     initial_soc = soc_ts["values"][0] if soc_ts and soc_ts.get("values") else 0.0
@@ -427,13 +565,15 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
                 )
 
     # ── reserves ──
-    n_intervals = len(interval_start)
     (
         reserve_config,
         reserve_columns,
         n_bands_per_product,
         offer_prices_per_product,
-    ) = _extract_reserves(model_input, n_intervals, info)
+        reserve_market_grids,
+    ) = _extract_reserves(model_input, ptu_starts_dt, info)
+    market_grids.update(reserve_market_grids)
+    n_intervals = len(interval_start)
 
     # ── build CSVs ──
 
@@ -553,6 +693,7 @@ def translate_scheduling(model_input: dict[str, Any]) -> TranslationResult:
         n_bands_per_product=n_bands_per_product,
         offer_prices_per_product=offer_prices_per_product,
         skip_counterfactual_reserves=skip_counterfactual,
+        market_grids=market_grids,
     )
 
 
@@ -565,6 +706,8 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
 
     interval_start: list[str] = model_input.get("interval_start", [])
     interval_end: list[str] = model_input.get("interval_end", [])
+    ptu_starts_dt = [_parse_iso_utc(t) for t in interval_start]
+    market_grids: dict[str, dict] = {}
 
     # ── detect n_segments ──
     n_segments = 0
@@ -590,13 +733,22 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
 
     # ── timeseries ──
     market_pos_ts = _find_timeseries(model_input, "market_position")
-    market_position = market_pos_ts["values"] if market_pos_ts else []
+    market_position, _ = _expand_timeseries_to_ptu(
+        market_pos_ts, ptu_starts_dt, "market_position"
+    )
+    market_position = market_position or []
 
     grid_fee_in_ts = _find_timeseries(model_input, "grid_fee_in")
-    grid_fee_in_values = grid_fee_in_ts["values"] if grid_fee_in_ts else []
+    grid_fee_in_values, _ = _expand_timeseries_to_ptu(
+        grid_fee_in_ts, ptu_starts_dt, "grid_fee_in"
+    )
+    grid_fee_in_values = grid_fee_in_values or []
 
     grid_fee_out_ts = _find_timeseries(model_input, "grid_fee_out")
-    grid_fee_out_values = grid_fee_out_ts["values"] if grid_fee_out_ts else []
+    grid_fee_out_values, _ = _expand_timeseries_to_ptu(
+        grid_fee_out_ts, ptu_starts_dt, "grid_fee_out"
+    )
+    grid_fee_out_values = grid_fee_out_values or []
 
     soc_ts = _find_timeseries(model_input, "state_of_charge")
     initial_soc = soc_ts["values"][0] if soc_ts and soc_ts.get("values") else 0.0
@@ -672,13 +824,15 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
     # ── reserves ──
     # Extract reserve config before CSV building so the columns can be
     # appended to the row layout below.
-    n_intervals_for_reserves = len(interval_start)
     (
         reserve_config,
         reserve_columns,
         n_bands_per_product,
         offer_prices_per_product,
-    ) = _extract_reserves(model_input, n_intervals_for_reserves, info)
+        reserve_market_grids,
+    ) = _extract_reserves(model_input, ptu_starts_dt, info)
+    market_grids.update(reserve_market_grids)
+    n_intervals_for_reserves = len(interval_start)
 
     # Intraday never *bids* reserves: any market entry the caller included
     # is treated as committed-only, so flip ``open`` to False here.  The
@@ -883,4 +1037,5 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
         n_bands_per_product=n_bands_per_product,
         offer_prices_per_product=offer_prices_per_product,
         skip_counterfactual_reserves=skip_counterfactual,
+        market_grids=market_grids,
     )

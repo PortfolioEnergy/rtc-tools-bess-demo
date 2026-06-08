@@ -176,6 +176,7 @@ def _run_scheduling(
             n_bands_per_product=translation.n_bands_per_product,
             offer_prices_per_product=translation.offer_prices_per_product,
             reserve_config=translation.reserve_config,
+            market_grids=translation.market_grids,
             counterfactual_metrics=counterfactual_metrics,
             skip_counterfactual_reserves=translation.skip_counterfactual_reserves,
         )
@@ -265,6 +266,7 @@ def _run_intraday(
             n_bands_per_product=translation.n_bands_per_product,
             offer_prices_per_product=translation.offer_prices_per_product,
             reserve_config=translation.reserve_config,
+            market_grids=translation.market_grids,
             counterfactual_metrics=counterfactual_metrics,
             skip_counterfactual_reserves=translation.skip_counterfactual_reserves,
         )
