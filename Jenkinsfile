@@ -1,16 +1,16 @@
 // PROJECT SETTINGS
-def IMAGE_NAME = "optimizer"
-def PYTHON_PACKAGE_NAME = "optimizer"
+def IMAGE_NAME = "rtc-optimizer"
+def PYTHON_PACKAGE_NAME = "rtc-optimizer"
 def DOCKER_REGISTRY_NAME = "vertexinternalcontainers"
 def CI_REGISTRY = "${DOCKER_REGISTRY_NAME}.azurecr.io"
 def DOCKER_REGISTRY = "${CI_REGISTRY}/docker/vertex-cloudems/"
 def DOCKER_FILE_PATH = "."
-def SONARQUBE_PROJECT_NAME = "Vertex-CloudEMS-Optimizer"
+def SONARQUBE_PROJECT_NAME = "Vertex-CloudEMS-RTC-optimizer"
 def SONARQUBE_HOST = "https://sonarqube.eehc.nl"
 def COVERAGE_REPORT = "coverage.xml"
 def DOCKER_CONTAINER_REGISTRY_URL = "https://index.docker.io/v1/"
 def GITOPS_REPO_URL = "https://github.com/EnergyEssentials/vtx-config.git"
-def GITOPS_MODULE_KEY = "vertex-cloudems-optimizer"
+def GITOPS_MODULE_KEY = "vertex-cloudems-rtc-optimizer"
 
 // BUILD PARAMETERS
 def VERSION = "0.0.1"
@@ -21,7 +21,7 @@ def CI_REGISTRY_ACCESS_KEY = "${DOCKER_REGISTRY_NAME}_base64_accesskey"
 def sendFailureMessageOnSlack(details) {
     slackSend(
         channel: '#vtx-jenkins',
-        message: "CloudEMS Optimizer Pipeline fail. Job: '${env.JOB_NAME} [${env.BUILD_NUMBER}]' - ${env.BUILD_URL}. Details: ${details}",
+        message: "CloudEMS RTC Optimizer Pipeline fail. Job: '${env.JOB_NAME} [${env.BUILD_NUMBER}]' - ${env.BUILD_URL}. Details: ${details}",
         color: '#FF0000'
     )
 }
@@ -29,12 +29,12 @@ def sendFailureMessageOnSlack(details) {
 def sendSucceedMessageOnSlack() {
     slackSend(
         channel: '#vtx-jenkins',
-        message: "CloudEMS Optimizer Pipeline succeed. Job: '${env.JOB_NAME} [${env.BUILD_NUMBER}]' - ${env.BUILD_URL}.",
+        message: "CloudEMS RTC Optimizer Pipeline succeed. Job: '${env.JOB_NAME} [${env.BUILD_NUMBER}]' - ${env.BUILD_URL}.",
         color: '#36a64f'
     )
 }
 
-podTemplate(label: 'optimizer-build-pod', cloud: 'kubernetes', serviceAccount: 'vertex',
+podTemplate(label: 'rtc-optimizer-build-pod', cloud: 'kubernetes', serviceAccount: 'vertex',
   yaml: """
   apiVersion: v1
   kind: Pod
@@ -64,7 +64,7 @@ podTemplate(label: 'optimizer-build-pod', cloud: 'kubernetes', serviceAccount: '
             memory: "12Gi"
   """,
   volumes: []) {
-    node('optimizer-build-pod') {
+    node('rtc-optimizer-build-pod') {
         try {
             stage('Checkout source') {
                 scm_result = checkout scm
@@ -81,7 +81,7 @@ podTemplate(label: 'optimizer-build-pod', cloud: 'kubernetes', serviceAccount: '
                 VERSION = "${versionNumber}.${currentBuild.id}"
 
                 currentBuild.displayName = "${VERSION}"
-                currentBuild.description = "Build of CloudEMS Optimizer version ${VERSION}"
+                currentBuild.description = "Build of CloudEMS RTC Optimizer version ${VERSION}"
 
                 def gitCommitShortCode = COMMITHASH[0..7]
                 def informationalVersion = "V${VERSION} (${gitCommitShortCode})"
