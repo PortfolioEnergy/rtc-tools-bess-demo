@@ -145,33 +145,28 @@ podTemplate(label: 'rtc-optimizer-build-pod', cloud: 'kubernetes', serviceAccoun
             }
 
             stage('Build Docker Images') {
-                withCredentials([string(credentialsId: 'github_pat_nopermissions', variable: 'github_token')]) {
-                    withCredentials([string(credentialsId: 'sonarqube_token', variable: 'sonarqube_token')]) {
-                        // make a writable place to unstash
-                        sh 'mkdir -p tmp_shared && chmod 777 tmp_shared'
+                withCredentials([string(credentialsId: 'sonarqube_token', variable: 'sonarqube_token')]) {
+                    // make a writable place to unstash
+                    sh 'mkdir -p tmp_shared && chmod 777 tmp_shared'
 
-                        dir('tmp_shared') {
-                            unstash 'coverage'
-                            sh "ls -la ${COVERAGE_REPORT}"
+                    dir('tmp_shared') {
+                        unstash 'coverage'
+                        sh "ls -la ${COVERAGE_REPORT}"
+                    }
+                    container('buildkit') {
+                        def IMAGE = "${DOCKER_REGISTRY}${IMAGE_NAME}:${VERSION}"
+
+                        try {
+                            sh """
+                                cp tmp_shared/${COVERAGE_REPORT} ${DOCKER_FILE_PATH}/${COVERAGE_REPORT}
+                                buildctl build --frontend=dockerfile.v0 --local dockerfile=${DOCKER_FILE_PATH} --opt target=sonarqube --opt filename=Dockerfile --opt build-arg:SONAR_HOST=${SONARQUBE_HOST} --opt build-arg:SONAR_BRANCH=${BRANCH_NAME} --opt build-arg:SONAR_TOKEN=${sonarqube_token} --opt build-arg:SONAR_PROJECT_KEY=${SONARQUBE_PROJECT_NAME} --opt build-arg:COVERAGE_REPORT=${COVERAGE_REPORT} --local context=.
+                                buildctl build --frontend=dockerfile.v0 --local dockerfile=${DOCKER_FILE_PATH} --opt target=final --opt filename=Dockerfile --opt build-arg:APP_VERSION=${VERSION} --local context=. --output type=image,name=${IMAGE},push=true
+                            """
+                        } catch (e) {
+                            sendFailureMessageOnSlack('Docker build failed')
+                            throw e
                         }
-                        container('buildkit') {
-                            def IMAGE = "${DOCKER_REGISTRY}${IMAGE_NAME}:${VERSION}"
-
-                            try {
-                                sh """
-                                    cp tmp_shared/${COVERAGE_REPORT} ${DOCKER_FILE_PATH}/${COVERAGE_REPORT}
-                                    buildctl build --frontend=dockerfile.v0 --local dockerfile=${DOCKER_FILE_PATH} --opt target=sonarqube --opt filename=Dockerfile --opt build-arg:SONAR_HOST=${SONARQUBE_HOST} --opt build-arg:SONAR_BRANCH=${BRANCH_NAME} --opt build-arg:SONAR_TOKEN=${sonarqube_token} --opt build-arg:SONAR_PROJECT_KEY=${SONARQUBE_PROJECT_NAME} --opt build-arg:COVERAGE_REPORT=${COVERAGE_REPORT} --local context=.
-                                    buildctl build --frontend=dockerfile.v0 --local dockerfile=${DOCKER_FILE_PATH} --opt target=final --opt filename=Dockerfile --opt build-arg:APP_VERSION=${VERSION} --local context=. --output type=image,name=${IMAGE},push=true
-
-                                    # Extract only the pre-built orderbook_core wheel (tiny stage, seconds not hours)
-                                    buildctl build --frontend=dockerfile.v0 --local dockerfile=${DOCKER_FILE_PATH} --opt target=wheel-export --opt filename=Dockerfile --local context=. --output type=local,dest=rust-wheels
-                                """
-                            } catch (e) {
-                                sendFailureMessageOnSlack('Docker build failed')
-                                throw e
-                            }
-                            milestone(1)
-                        }
+                        milestone(1)
                     }
                 }
             }
