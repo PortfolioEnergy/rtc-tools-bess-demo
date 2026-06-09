@@ -44,6 +44,14 @@ class TranslationResult:
     # ``blocks`` PTU-index partition; rtc_to_pe collapses output members
     # onto this grid by taking the first PTU value of each block.
     market_grids: dict[str, dict] = field(default_factory=dict)
+    # aFRR energy bid metadata — consumed by the post-solve computation in
+    # rtc_to_pe to derive marginal-cost energy bid prices.
+    afrr_energy_obligation_up: list[float] = field(default_factory=list)
+    afrr_energy_obligation_down: list[float] = field(default_factory=list)
+    afrr_energy_open_mask: list[bool] = field(default_factory=list)
+    afrr_energy_n_bands: int = 0
+    afrr_energy_markup: float = 0.0
+    afrr_energy_grid: dict | None = None
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -238,6 +246,82 @@ def _expand_timeseries_to_ptu(
         [float(values[k]) for k in membership],
         {"interval_start": list(starts_in), "interval_end": list(ends_in)},
     )
+
+
+def _expand_partial_timeseries(
+    ts: dict[str, Any] | None,
+    ptu_starts_dt: list[datetime],
+    n_intervals: int,
+    ts_name: str,
+) -> tuple[list[float], dict | None]:
+    """Expand a timeseries that may cover only a subset of PTUs.
+
+    Unlike ``_expand_timeseries_to_ptu`` which requires full PTU coverage,
+    this function allows the timeseries grid to cover only some PTUs.
+    Uncovered PTUs receive 0.0.  Used for aFRR energy obligations where
+    the caller only includes open PTUs in the grid.
+
+    Returns ``(values_per_ptu, grid)`` — same shape contract as
+    ``_expand_timeseries_to_ptu``.
+    """
+    if ts is None:
+        return [0.0] * n_intervals, None
+    values = ts.get("values")
+    if not values:
+        return [0.0] * n_intervals, None
+
+    starts_in = ts.get("interval_start") or []
+    ends_in = ts.get("interval_end") or []
+
+    # No per-timeseries grid → values are already at PTU resolution
+    if not starts_in and not ends_in:
+        padded = _pad_to(values, n_intervals)
+        return padded, None
+
+    if len(values) != len(starts_in):
+        raise ValueError(
+            f"timeseries '{ts_name}': values ({len(values)}) and "
+            f"interval_start ({len(starts_in)}) lengths differ"
+        )
+
+    starts_dt = [_parse_iso_utc(t) for t in starts_in]
+    ends_dt = [_parse_iso_utc(t) for t in ends_in]
+    result = [0.0] * n_intervals
+
+    for ptu_idx, ptu_start in enumerate(ptu_starts_dt):
+        block = next(
+            (
+                k
+                for k, (s, e) in enumerate(zip(starts_dt, ends_dt))
+                if s <= ptu_start < e
+            ),
+            None,
+        )
+        if block is not None:
+            result[ptu_idx] = float(values[block])
+
+    # Build the grid with blocks for output shaping
+    blocks: list[list[int]] = []
+    bucket: dict[int, list[int]] = {}
+    for ptu_idx, ptu_start in enumerate(ptu_starts_dt):
+        block = next(
+            (
+                k
+                for k, (s, e) in enumerate(zip(starts_dt, ends_dt))
+                if s <= ptu_start < e
+            ),
+            None,
+        )
+        if block is not None:
+            bucket.setdefault(block, []).append(ptu_idx)
+    blocks = [bucket[k] for k in sorted(bucket)]
+
+    grid = {
+        "interval_start": list(starts_in),
+        "interval_end": list(ends_in),
+        "blocks": blocks,
+    }
+    return result, grid
 
 
 def _blocks_from_grid(
@@ -435,6 +519,74 @@ def _extract_reserves(
         offer_prices_per_product,
         market_grids,
     )
+
+
+# ── aFRR energy bids (post-solve pricing) ────────────────────────────
+
+
+def _extract_afrr_energy_market(
+    model_input: dict[str, Any],
+    ptu_starts_dt: list[datetime],
+    info: list[str],
+) -> tuple[list[float], list[float], list[bool], int, float, dict | None]:
+    """Extract aFRR energy bid inputs from the PE request.
+
+    Returns ``(obligation_up, obligation_down, open_mask, n_bands, markup, grid)``:
+
+    - ``obligation_up`` / ``obligation_down`` — per-PTU obligation in MW (0.0
+      for PTUs not open for energy bidding).
+    - ``open_mask`` — True for PTUs where an energy bid must be submitted.
+    - ``n_bands`` — number of price bands requested by the caller.
+    - ``markup`` — configurable EUR/MWh risk premium added to the marginal cost.
+    - ``grid`` — the market's own ``interval_start`` / ``interval_end`` for
+      output shaping (None if no market present).
+    """
+    n_intervals = len(ptu_starts_dt)
+    default = ([0.0] * n_intervals, [0.0] * n_intervals, [False] * n_intervals, 0, 0.0, None)
+
+    market = None
+    for m in model_input.get("markets", []):
+        if m.get("name") == "afrr_energy":
+            market = m
+            break
+    if market is None:
+        return default
+
+    n_bands = int(market.get("n_price_bands", 1) or 1)
+    markup = float(_find_parameter(model_input, "afrr_energy_markup", default=0.0) or 0.0)
+
+    # Obligation timeseries use a partial grid (only open PTUs). Unlike
+    # other timeseries that must cover every PTU, obligations are zero for
+    # PTUs not in the grid.  We map values to covered PTUs manually.
+    up_ts = _find_timeseries(model_input, "afrr_energy_obligation_up")
+    obligation_up, up_grid = _expand_partial_timeseries(
+        up_ts, ptu_starts_dt, n_intervals, "afrr_energy_obligation_up"
+    )
+
+    down_ts = _find_timeseries(model_input, "afrr_energy_obligation_down")
+    obligation_down, down_grid = _expand_partial_timeseries(
+        down_ts, ptu_starts_dt, n_intervals, "afrr_energy_obligation_down"
+    )
+
+    # The market grid comes from whichever obligation timeseries declared one;
+    # prefer the up direction (arbitrary tie-break; both should be identical).
+    grid = up_grid or down_grid
+
+    # Open mask: a PTU is open for energy bidding if it has a non-zero
+    # obligation in either direction (the caller only includes open PTUs
+    # in the timeseries grid).
+    open_mask = [
+        obligation_up[i] != 0.0 or obligation_down[i] != 0.0
+        for i in range(n_intervals)
+    ]
+
+    n_open = sum(open_mask)
+    info.append(
+        f"applied: afrr_energy market — {n_open} open PTU(s), "
+        f"n_price_bands={n_bands}, markup={markup:.2f} EUR/MWh"
+    )
+
+    return obligation_up, obligation_down, open_mask, n_bands, markup, grid
 
 
 # ── scheduling ───────────────────────────────────────────────────────
@@ -845,6 +997,16 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
                 "decision variables — only the committed position is honoured"
             )
 
+    # ── aFRR energy bids ──
+    (
+        afrr_energy_obligation_up,
+        afrr_energy_obligation_down,
+        afrr_energy_open_mask,
+        afrr_energy_n_bands,
+        afrr_energy_markup,
+        afrr_energy_grid,
+    ) = _extract_afrr_energy_market(model_input, ptu_starts_dt, info)
+
     # ── build CSVs ──
 
     # timeseries_import.csv
@@ -1038,4 +1200,10 @@ def translate_intraday(model_input: dict[str, Any]) -> TranslationResult:
         offer_prices_per_product=offer_prices_per_product,
         skip_counterfactual_reserves=skip_counterfactual,
         market_grids=market_grids,
+        afrr_energy_obligation_up=afrr_energy_obligation_up,
+        afrr_energy_obligation_down=afrr_energy_obligation_down,
+        afrr_energy_open_mask=afrr_energy_open_mask,
+        afrr_energy_n_bands=afrr_energy_n_bands,
+        afrr_energy_markup=afrr_energy_markup,
+        afrr_energy_grid=afrr_energy_grid,
     )

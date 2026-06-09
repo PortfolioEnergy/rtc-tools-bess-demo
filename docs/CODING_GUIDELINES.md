@@ -35,6 +35,19 @@ def place_order(self, delivery_start: int, ...) -> dict:
 
 ---
 
+## Library-first development
+
+Before writing any new helper, utility, or method:
+
+1. **Scan installed packages first.** Check `package.json` / `pyproject.toml` / `Cargo.toml` for existing dependencies that already cover the need.
+2. **Check the stdlib.** Prefer language built-ins and standard library modules.
+3. **Search the codebase.** Grep for similar function names or patterns — an equivalent may already exist.
+4. **Search the web for packages.** If nothing installed covers the need, search for well-maintained packages that do. Prefer importing an established library over writing bespoke code.
+5. **Only write custom code as a last resort.** If no package exists or fits, implement it — and explain why.
+6. **confirm before installing any new package** Prompt user to allow install. show package creator, version compatibility, latest update and development status for that version.
+
+**Default preference order: installed package → stdlib → new package import → custom code.**
+
 ## Comments
 
 **Rule: Comments explain "why", not "what".**

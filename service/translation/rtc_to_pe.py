@@ -9,6 +9,7 @@ entries so that the response shape (``members`` + ``_info``) stays unchanged.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -160,6 +161,145 @@ def _emit_reserve_members(
         )
 
 
+# ── aFRR energy bid pricing (post-solve) ────────────────────────────
+
+
+def _compute_afrr_energy_bids(
+    df: pd.DataFrame,
+    df_input: pd.DataFrame,
+    n_segments: int,
+    obligation_up: list[float],
+    obligation_down: list[float],
+    open_mask: list[bool],
+    n_bands: int,
+    markup: float,
+    cycling_penalty: float,
+    stored_energy_value: float,
+    efficiency: float,
+    grid: dict | None,
+    info: list[str],
+) -> dict[str, Any]:
+    """Compute aFRR energy bid prices from the solved intraday state.
+
+    The energy bid price is derived from the marginal cost of activation:
+    opportunity cost + cycling penalty + efficiency loss + grid fees + markup.
+    All volume is allocated to band 1 (single-price strategy).
+
+    Returns a dict of output members keyed by wire-format name.
+    """
+    n = len(df)
+    members: dict[str, Any] = {}
+
+    if not any(open_mask[:n]):
+        return members
+
+    sqrt_eff = math.sqrt(efficiency) if efficiency > 0.0 else 1.0
+
+    # Reference price per PTU: mid-price of the orderbook (average of best
+    # bid and best ask). Falls back to 0 if orderbook columns are missing.
+    ref_prices = np.zeros(n)
+    best_bid_col = "bid_prices[1]"
+    best_ask_col = "ask_prices[1]"
+    if best_bid_col in df_input.columns and best_ask_col in df_input.columns:
+        bids = df_input[best_bid_col].to_numpy(dtype=float)[:n]
+        asks = df_input[best_ask_col].to_numpy(dtype=float)[:n]
+        ref_prices = (bids + asks) / 2.0
+
+    # Grid fees from input
+    fee_out = (
+        df_input["grid_fee_out"].to_numpy(dtype=float)[:n]
+        if "grid_fee_out" in df_input.columns
+        else np.zeros(n)
+    )
+    fee_in = (
+        df_input["grid_fee_in"].to_numpy(dtype=float)[:n]
+        if "grid_fee_in" in df_input.columns
+        else np.zeros(n)
+    )
+
+    # Compute per-PTU energy bid prices
+    prices_up = np.zeros(n)
+    prices_down = np.zeros(n)
+    volumes_up = np.zeros(n)
+    volumes_down = np.zeros(n)
+
+    for t in range(n):
+        if not open_mask[t]:
+            continue
+
+        eff_loss_up = (1.0 / sqrt_eff - 1.0) * ref_prices[t]
+        eff_loss_down = (1.0 - sqrt_eff) * ref_prices[t]
+
+        prices_up[t] = (
+            stored_energy_value
+            + cycling_penalty
+            + eff_loss_up
+            + fee_out[t]
+            + markup
+        )
+        prices_down[t] = (
+            -stored_energy_value
+            + cycling_penalty
+            - eff_loss_down
+            + fee_in[t]
+            + markup
+        )
+
+        volumes_up[t] = obligation_up[t]
+        volumes_down[t] = obligation_down[t]
+
+        info.append(
+            f"afrr_energy_bid_up[{t}]: price={prices_up[t]:.2f} EUR/MWh = "
+            f"opportunity_cost({stored_energy_value:.2f}) + "
+            f"cycling({cycling_penalty:.2f}) + "
+            f"efficiency_loss({eff_loss_up:.2f}) + "
+            f"grid_fee({fee_out[t]:.2f}) + "
+            f"markup({markup:.2f})"
+        )
+        info.append(
+            f"afrr_energy_bid_down[{t}]: price={prices_down[t]:.2f} EUR/MWh = "
+            f"-opportunity_cost({stored_energy_value:.2f}) + "
+            f"cycling({cycling_penalty:.2f}) - "
+            f"efficiency_loss({eff_loss_down:.2f}) + "
+            f"grid_fee({fee_in[t]:.2f}) + "
+            f"markup({markup:.2f})"
+        )
+
+    # Shape output onto the aFRR energy market grid
+    up_price_values = prices_up.tolist()
+    up_volume_values = volumes_up.tolist()
+    down_price_values = prices_down.tolist()
+    down_volume_values = volumes_down.tolist()
+
+    # Band 1 gets all volume; remaining bands are zero
+    members["afrr_energy_up_price[1]"] = _shape_by_grid(up_price_values, grid)
+    members["afrr_energy_up_volume[1]"] = _shape_by_grid(up_volume_values, grid)
+    members["afrr_energy_down_price[1]"] = _shape_by_grid(down_price_values, grid)
+    members["afrr_energy_down_volume[1]"] = _shape_by_grid(down_volume_values, grid)
+
+    if n_bands > 1:
+        zeros = [0.0] * (len(grid["blocks"]) if grid and "blocks" in grid else n)
+        zero_payload: dict[str, Any] = {"values": zeros}
+        if grid is not None:
+            zero_payload["interval_start"] = list(grid["interval_start"])
+            zero_payload["interval_end"] = list(grid["interval_end"])
+        for k in range(2, n_bands + 1):
+            members[f"afrr_energy_up_price[{k}]"] = {
+                key: list(val) for key, val in zero_payload.items()
+            }
+            members[f"afrr_energy_up_volume[{k}]"] = {
+                key: list(val) for key, val in zero_payload.items()
+            }
+            members[f"afrr_energy_down_price[{k}]"] = {
+                key: list(val) for key, val in zero_payload.items()
+            }
+            members[f"afrr_energy_down_volume[{k}]"] = {
+                key: list(val) for key, val in zero_payload.items()
+            }
+
+    return members
+
+
 # ── scheduling ───────────────────────────────────────────────────────
 
 
@@ -275,6 +415,15 @@ def translate_intraday_result(
     market_grids: dict[str, dict] | None = None,
     counterfactual_metrics: dict[str, Any] | None = None,
     skip_counterfactual_reserves: bool = False,
+    afrr_energy_obligation_up: list[float] | None = None,
+    afrr_energy_obligation_down: list[float] | None = None,
+    afrr_energy_open_mask: list[bool] | None = None,
+    afrr_energy_n_bands: int = 0,
+    afrr_energy_markup: float = 0.0,
+    afrr_energy_grid: dict | None = None,
+    cycling_penalty_factor: float = 0.0,
+    stored_energy_value: float = 0.0,
+    efficiency: float = 0.9,
 ) -> tuple[dict[str, Any], str]:
     """Build PE API response from intraday solver output.
 
@@ -346,6 +495,29 @@ def translate_intraday_result(
         offer_prices_per_product or {},
         market_grids or {},
     )
+
+    # aFRR energy bid pricing — post-solve marginal-cost computation.
+    if afrr_energy_open_mask and any(afrr_energy_open_mask):
+        input_csv_path = output_dir.parent / "input" / "timeseries_import.csv"
+        df_input = pd.read_csv(input_csv_path, parse_dates=["time"])
+        if len(df_input) > n:
+            df_input = df_input.iloc[1 : n + 1].reset_index(drop=True)
+        energy_members = _compute_afrr_energy_bids(
+            df,
+            df_input,
+            n_segments,
+            afrr_energy_obligation_up or [],
+            afrr_energy_obligation_down or [],
+            afrr_energy_open_mask,
+            afrr_energy_n_bands,
+            afrr_energy_markup,
+            cycling_penalty_factor,
+            stored_energy_value,
+            efficiency,
+            afrr_energy_grid,
+            info,
+        )
+        members.update(energy_members)
 
     reasoning_markdown = ""
     if prob is not None:

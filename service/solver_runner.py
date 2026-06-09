@@ -269,6 +269,15 @@ def _run_intraday(
             market_grids=translation.market_grids,
             counterfactual_metrics=counterfactual_metrics,
             skip_counterfactual_reserves=translation.skip_counterfactual_reserves,
+            afrr_energy_obligation_up=translation.afrr_energy_obligation_up,
+            afrr_energy_obligation_down=translation.afrr_energy_obligation_down,
+            afrr_energy_open_mask=translation.afrr_energy_open_mask,
+            afrr_energy_n_bands=translation.afrr_energy_n_bands,
+            afrr_energy_markup=translation.afrr_energy_markup,
+            afrr_energy_grid=translation.afrr_energy_grid,
+            cycling_penalty_factor=translation.cycling_penalty,
+            stored_energy_value=translation.stored_energy_value,
+            efficiency=_get_efficiency(translation),
         )
         response: dict[str, Any] = {"result": result}
         if reasoning_markdown:
@@ -277,6 +286,22 @@ def _run_intraday(
 
 
 # ── helpers ──────────────────────────────────────────────────────────
+
+
+def _get_efficiency(translation: TranslationResult) -> float:
+    """Extract round-trip efficiency from the translation's parameters CSV.
+
+    Falls back to the Modelica default (0.9) when no override was provided.
+    """
+    if translation.parameters_csv:
+        import csv
+        import io
+
+        reader = csv.DictReader(io.StringIO(translation.parameters_csv))
+        for row in reader:
+            if "efficiency" in row:
+                return float(row["efficiency"])
+    return 0.9
 
 
 def _prepare_io_dirs(base: Path) -> None:
