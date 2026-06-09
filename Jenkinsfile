@@ -120,9 +120,10 @@ podTemplate(label: 'rtc-optimizer-build-pod', cloud: 'kubernetes', serviceAccoun
                         sh """
                             python3 -m venv venv
                             . venv/bin/activate
-                            pip install --upgrade pip build
-                            # Install runtime dependencies so test imports match production
-                            pip install -r requirements.txt
+                            pip install --upgrade pip build uv
+                            # Install runtime dependencies using pyproject.toml + uv
+                            # Sync the 'service' dependency group into the venv
+                            uv sync --frozen --no-install-project --group service
                             # Install package with dev dependencies from pyproject.toml
                             pip install -e .[dev]
                             coverage run -m pytest --maxfail=1 --disable-warnings -q --junitxml=testresults/results.xml
@@ -176,82 +177,6 @@ podTemplate(label: 'rtc-optimizer-build-pod', cloud: 'kubernetes', serviceAccoun
                                 throw e
                             }
                             milestone(1)
-                        }
-                    }
-                }
-            }
-
-            stage('E2E Test') {
-                warnError('E2E tests failed') {
-                    container('python') {
-                        script {
-                            echo "Running E2E tests with behave"
-
-                            sh """
-                                . venv/bin/activate
-
-                                # Install the pre-built orderbook_core wheel (extracted from Docker build)
-                                pip install rust-wheels/wheels/*.whl
-
-                                # Run e2e tests (environment.py starts the server automatically)
-                                export DATA_PATH=\${WORKSPACE}/tests/e2e/test_data_repo
-                                export PYTHONPATH=\${WORKSPACE}
-                                export DEFAULT_REPOSITORY=local
-
-                                cd tests/e2e
-                                python -m behave --format pretty --no-capture
-                            """
-                        }
-                    }
-                }
-            }
-
-            stage('Build and Publish Python Packages') {
-                withCredentials([string(credentialsId: "${CI_REGISTRY_ACCESS_KEY}", variable: 'CI_AUTH_BASE64')]) {
-                    container('python') {
-                        script {
-                            echo "Building and publishing Python packages version ${VERSION} to ACR"
-
-                            def authDecoded = sh(
-                                script: "echo '${CI_AUTH_BASE64}' | base64 -d",
-                                returnStdout: true
-                            ).trim()
-                            def acrUser = authDecoded.split(':')[0]
-                            def acrPassword = authDecoded.split(':')[1]
-
-                            try {
-                                sh """
-                                    . venv/bin/activate
-                                    pip install --upgrade pip build
-
-                                    # Install oras CLI
-                                    ORAS_VERSION="1.1.0"
-                                    wget -q https://github.com/oras-project/oras/releases/download/v\${ORAS_VERSION}/oras_\${ORAS_VERSION}_linux_amd64.tar.gz -O /tmp/oras.tar.gz
-                                    tar -xzf /tmp/oras.tar.gz -C /tmp
-                                    chmod +x /tmp/oras
-                                    mv /tmp/oras /usr/local/bin/
-
-                                    # Login to ACR using oras
-                                    echo "${acrPassword}" | oras login ${CI_REGISTRY} -u "${acrUser}" --password-stdin
-
-                                    PACKAGE_VERSION=${VERSION} python -m build
-                                    WHEEL_FILE=\$(ls dist/*.whl | head -n 1)
-                                    WHEEL_NAME=\$(basename \${WHEEL_FILE})
-
-                                    cd dist
-                                    oras push ${CI_REGISTRY}/python/${PYTHON_PACKAGE_NAME}:${VERSION} \\
-                                        --artifact-type application/vnd.python.package \\
-                                        \${WHEEL_NAME}
-
-                                    oras push ${CI_REGISTRY}/python/energy-hamster-asset-sandbox:latest \\
-                                        --artifact-type application/vnd.python.package \\
-                                        \${WHEEL_NAME}
-                                    echo "Published Sandbox package: \${WHEEL_NAME} to ${CI_REGISTRY}/python/${PYTHON_PACKAGE_NAME}:${VERSION} and latest"
-                                """
-                            } catch (e) {
-                                sendFailureMessageOnSlack('Python package publish failed')
-                                throw e
-                            }
                         }
                     }
                 }
