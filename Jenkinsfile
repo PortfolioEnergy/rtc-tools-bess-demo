@@ -53,7 +53,7 @@ podTemplate(label: 'rtc-optimizer-build-pod', cloud: 'kubernetes', serviceAccoun
         securityContext:
           privileged: true
       - name: python
-        image: python:3.11.6
+        image: python:3.13
         tty: true
         stdin: true
         command: ['cat']
@@ -118,16 +118,10 @@ podTemplate(label: 'rtc-optimizer-build-pod', cloud: 'kubernetes', serviceAccoun
                 container('python') {
                     try {
                         sh """
-                            python3 -m venv venv
-                            . venv/bin/activate
-                            pip install --upgrade pip build uv
-                            # Install runtime dependencies using pyproject.toml + uv
-                            # Sync the 'service' dependency group into the venv
-                            uv sync --frozen --no-install-project --group service
-                            # Install package with dev dependencies from pyproject.toml
-                            pip install -e .[dev]
-                            coverage run -m pytest --maxfail=1 --disable-warnings -q --junitxml=testresults/results.xml
-                            coverage xml -o ${COVERAGE_REPORT}
+                            pip install uv
+                            uv sync --frozen --group dev
+                            uv run coverage run -m pytest --maxfail=1 --disable-warnings -q --junitxml=testresults/results.xml
+                            uv run coverage xml -o ${COVERAGE_REPORT}
                             test -f ${COVERAGE_REPORT}
                         """
                     } catch (e) {
