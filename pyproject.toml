@@ -28,6 +28,7 @@ dev = [
     {include-group = "service"},
     "pytest>=8.0.0",
     "httpx>=0.27.0",
+    "coverage>=7.0.0",
 ]
 docs = [
     "sphinx",
