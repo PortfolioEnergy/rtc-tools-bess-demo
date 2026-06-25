@@ -1,0 +1,29 @@
+# Dependabot configuration.
+#
+# Security updates (alert-driven) are grouped into a single pull request per
+# ecosystem instead of one pull request per advisory. Version updates run
+# monthly, also grouped per ecosystem, with a 7-day cooldown so brand-new
+# releases are not adopted the day they ship.
+#
+# Reference:
+# https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    groups:
+      uv-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      uv-version:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
