@@ -11,7 +11,7 @@ dependencies = [
     "rtc-tools>=2.8.0",
     "numpy>=2.5.1",
     "matplotlib>=3.11.1",
-    "pandas>=2.2.3",
+    "pandas>=3.0.5",
 ]
 
 [dependency-groups]
