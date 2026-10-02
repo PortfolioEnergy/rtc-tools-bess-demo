@@ -6,7 +6,7 @@ authors = [
     {name = "PortfolioEnergy", email = "info@portfolioenergy.com"},
 ]
 readme = "README.md"
-requires-python = "==3.13.*"
+requires-python = ">=3.14"
 dependencies = [
     "rtc-tools>=2.8.0",
     "numpy>=2.5.1",
